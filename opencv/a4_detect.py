@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 import config
-from utils import order_points, quad_angles, quad_aspect_ratio
+from utils import compute_midline, order_points, quad_angles, quad_aspect_ratio
 
 
 class A4Detector:
@@ -74,9 +74,11 @@ class A4Detector:
         if best is None:
             return {"status": False}
 
+        corners = best.astype(int).tolist()
         return {
             "status": True,
-            "corners": best.astype(int).tolist(),
+            "corners": corners,
+            "midline": compute_midline(corners),
         }
 
     @staticmethod

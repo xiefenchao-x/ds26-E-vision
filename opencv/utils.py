@@ -63,6 +63,20 @@ def quad_aspect_ratio(corners):
     return max(width, height) / min(width, height)
 
 
+def midpoint(point_a, point_b):
+    return [
+        int((int(point_a[0]) + int(point_b[0])) * 0.5),
+        int((int(point_a[1]) + int(point_b[1])) * 0.5),
+    ]
+
+
+def compute_midline(corners):
+    tl, tr, br, bl = corners
+    top_mid = midpoint(tl, tr)
+    bottom_mid = midpoint(bl, br)
+    return [top_mid, bottom_mid]
+
+
 def draw_status(frame, text, ok):
     color = config.COLOR_SUCCESS if ok else config.COLOR_FAIL
     cv2.rectangle(frame, (8, 8), (260, 42), config.COLOR_TEXT_BG, -1)
@@ -135,6 +149,12 @@ def draw_a4_result(frame, result):
 
     corners = np.asarray(result["corners"], dtype=np.int32)
     cv2.polylines(frame, [corners], True, config.COLOR_SUCCESS, 3)
+    midline = result.get("midline")
+    if midline:
+        top_mid, bottom_mid = midline
+        cv2.line(frame, tuple(top_mid), tuple(bottom_mid), config.COLOR_CORNER, 2)
+        cv2.circle(frame, tuple(top_mid), 5, config.COLOR_CORNER, -1)
+        cv2.circle(frame, tuple(bottom_mid), 5, config.COLOR_CORNER, -1)
 
     labels = ["TL", "TR", "BR", "BL"]
     for label, (x, y) in zip(labels, corners):
