@@ -1,8 +1,13 @@
 from maix import app, camera, display, image, key, time
+try:
+    from maix import uart
+except Exception:
+    uart = None
 import cv2
 import numpy as np
 import math
 import itertools
+import struct
 
 
 # =========================
@@ -13,6 +18,10 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 WARP_W = 594
 WARP_H = 420
+A4_W_CM = 29.7
+A4_H_CM = 21.0
+A4_W_MM = A4_W_CM * 10.0
+A4_H_MM = A4_H_CM * 10.0
 
 GAUSSIAN_KERNEL = (5, 5)
 CANNY_LOW = 50
@@ -32,13 +41,31 @@ MAX_LOST_FRAMES = 5
 
 PIECE_DETECTION_ENABLED = True
 FIRST_QUESTION_MODE = True
+PIECE_MASK_METHOD = "hsv"
+PIECE_PROCESS_A4_ROI = True
 PIECE_BG_BORDER_SAMPLE = 24
 PIECE_BG_DIFF_THRESHOLD = 35.0
+PIECE_L_DIFF_WEIGHT = 0.25
+PIECE_A_DIFF_WEIGHT = 1.0
+PIECE_B_DIFF_WEIGHT = 1.0
+PIECE_GREEN_H_LOW = 51
+PIECE_GREEN_H_HIGH = 91
+PIECE_GREEN_S_LOW = 52
+PIECE_GREEN_S_HIGH = 255
+PIECE_GREEN_V_LOW = 75
+PIECE_GREEN_V_HIGH = 255
+PIECE_HSV_DIFF_THRESHOLD = 35.0
+PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)
+PIECE_MASK_MEDIAN_KERNEL = 3
 PIECE_MASK_OPEN_KERNEL = (3, 3)
 PIECE_MASK_CLOSE_KERNEL = (3, 3)
 # OPEN 会直接削掉凸出的尖角。背景差分已经比较干净，默认关闭，只保留一次小核 CLOSE 补断口。
 PIECE_MASK_OPEN_ITERATIONS = 0
-PIECE_MASK_CLOSE_ITERATIONS = 1
+PIECE_MASK_CLOSE_ITERATIONS = 0
+PIECE_USE_CLEAN_MASK_FOR_CONTOURS = False
+PIECE_SPLIT_TOUCHING_ENABLED = False
+PIECE_SPLIT_ERODE_KERNEL = (3, 3)
+PIECE_SPLIT_ERODE_ITERATIONS = 3
 PIECE_USE_CONVEX_HULL = True
 PIECE_APPROX_EPSILON_RATIO = 0.02
 PIECE_APPROX_EPSILON_STEP = 0.005
@@ -57,6 +84,9 @@ PIECE_MAX_ASPECT_RATIO = 8.0
 
 FIRST_Q_RECT_W_CM = 10.0
 FIRST_Q_RECT_H_CM = 6.0
+FIRST_Q_TARGET_SIDE = "auto"
+FIRST_Q_TARGET_ORIENTATION = "portrait"
+FIRST_Q_PLACE_MARGIN_CM = 0.6
 FIRST_Q_DIAG_A = [2.0, 0.0]
 FIRST_Q_DIAG_P = [3.6, 1.2]
 FIRST_Q_DIAG_Q = [7.6, 4.2]
@@ -77,12 +107,31 @@ ANGLE_MIN = 65.0
 ANGLE_MAX = 115.0
 
 PRINT_INTERVAL_MS = 500
+PRINT_MOVE_ONLY = True
 SHOW_DEBUG_INFO = False
 ENABLE_KEY_EXIT = True
 
+SERIAL_OUTPUT_ENABLED = True
+SERIAL_PORT = "/dev/ttyS4"
+SERIAL_BAUDRATE = 115200
+SERIAL_BINARY_PACKET = True
+
+# 机械坐标标定点，顺序是标准 A4 透视图里的 TL/TR/BR/BL。
+# 默认值表示以 A4 左上角为机械原点，单位 mm；实车标定时改成机械端实测坐标。
+MECH_COORD_OUTPUT_ENABLED = True
+MECH_COORD_DECIMALS = 0
+MECH_ROTATE_SCALE = 10.0
+MECH_CALIBRATION_POINTS = [
+    [0.0, 0.0],
+    [A4_W_MM, 0.0],
+    [A4_W_MM, A4_H_MM],
+    [0.0, A4_H_MM],
+]
+
 # 显示模式：0 原图 + A4 外框，1 透视图 + 最终碎片，2 色差图，3 raw mask，4 clean mask，5 候选轮廓，6 筛选结果 + 参数。
-DISPLAY_MODE = 6
-DEBUG_SHOW_ORIGINAL_PROCESS = 0
+DISPLAY_MODE = 1
+# 1 表示调试图直接显示原始摄像头坐标，避免透视插值把绿色窄缝显示成灰边。
+DEBUG_SHOW_ORIGINAL_PROCESS = 1
 
 # 调试视图保留给现场排查，常规阶段 2 显示由 DISPLAY_MODE 控制。
 DEBUG_VIEW_MODE = 0
@@ -93,6 +142,7 @@ YELLOW = (0, 255, 255)
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 BLUE = (255, 0, 0)
+CYAN = (255, 255, 0)
 
 
 # =========================
@@ -324,12 +374,8 @@ def detect_pieces(frame, corners, matrix):
     frame_h, frame_w = frame.shape[:2]
     frame_area = WARP_W * WARP_H
     detect_mask = make_a4_inner_mask(frame.shape[:2], corners)
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    bg_color = estimate_background_lab(lab, detect_mask)
-    diff = lab.astype(np.float32) - bg_color.reshape(1, 1, 3)
-    distance_map = np.sqrt(np.sum(diff * diff, axis=2))
-    raw_mask = np.where(distance_map > PIECE_BG_DIFF_THRESHOLD, 255, 0).astype(np.uint8)
-    raw_mask = cv2.bitwise_and(raw_mask, detect_mask)
+    process_frame, process_mask, roi = crop_to_mask_roi(frame, detect_mask)
+    distance_map, raw_mask, bg_color = make_piece_mask(process_frame, process_mask)
 
     mask = raw_mask
     if PIECE_MASK_OPEN_ITERATIONS > 0:
@@ -338,9 +384,27 @@ def detect_pieces(frame, corners, matrix):
     if PIECE_MASK_CLOSE_ITERATIONS > 0:
         close_kernel = np.ones(PIECE_MASK_CLOSE_KERNEL, np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=PIECE_MASK_CLOSE_ITERATIONS)
-    mask = cv2.bitwise_and(mask, detect_mask)
+    if PIECE_MASK_OPEN_ITERATIONS > 0 or PIECE_MASK_CLOSE_ITERATIONS > 0:
+        mask = cv2.bitwise_and(mask, detect_mask)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if PIECE_SPLIT_TOUCHING_ENABLED:
+        split_mask = split_touching_piece_mask(raw_mask, process_mask)
+        contour_mask = split_mask
+        contour_mask_name = "split"
+    else:
+        split_mask = raw_mask
+        contour_mask = mask if PIECE_USE_CLEAN_MASK_FOR_CONTOURS else raw_mask
+        contour_mask_name = "clean" if PIECE_USE_CLEAN_MASK_FOR_CONTOURS else "raw"
+    contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = offset_contours_from_roi(contours, roi)
+    distance_map, raw_mask, mask, split_mask = expand_debug_images_from_roi(
+        distance_map,
+        raw_mask,
+        mask,
+        split_mask,
+        roi,
+        frame.shape[:2],
+    )
     pieces = []
     piece_contours = []
     accepted_source_contours = []
@@ -420,23 +484,21 @@ def detect_pieces(frame, corners, matrix):
 
     if FIRST_QUESTION_MODE:
         assign_first_question_templates(pieces)
+        attach_first_question_targets(pieces)
 
-    piece_debug = {
-        "distance_map": cv2.warpPerspective(distance_map.astype(np.float32), matrix, (WARP_W, WARP_H)),
-        "raw_mask": cv2.warpPerspective(raw_mask, matrix, (WARP_W, WARP_H), flags=cv2.INTER_NEAREST),
-        "clean_mask": cv2.warpPerspective(mask, matrix, (WARP_W, WARP_H), flags=cv2.INTER_NEAREST),
-        "all_contours": warp_contours(contours, matrix),
-        "accepted_contours": piece_contours,
-        "accepted_source_contours": warp_contours(accepted_source_contours, matrix),
-        "distance_map_original": distance_map,
-        "raw_mask_original": raw_mask,
-        "clean_mask_original": mask,
-        "all_contours_original": contours,
-        "accepted_source_contours_original": accepted_source_contours,
-        "bg_color": bg_color,
-        "raw_contours_count": len(contours),
-        "accepted_count": len(pieces),
-    }
+    piece_debug = make_piece_debug(
+        distance_map,
+        raw_mask,
+        mask,
+        split_mask,
+        contours,
+        accepted_source_contours,
+        piece_contours,
+        matrix,
+        bg_color,
+        contour_mask_name,
+        len(pieces),
+    )
     return pieces, piece_contours, piece_debug
 
 
@@ -445,18 +507,197 @@ def make_empty_piece_debug():
         "distance_map": None,
         "raw_mask": None,
         "clean_mask": None,
+        "split_mask": None,
         "all_contours": [],
         "accepted_contours": [],
         "accepted_source_contours": [],
         "distance_map_original": None,
         "raw_mask_original": None,
         "clean_mask_original": None,
+        "split_mask_original": None,
         "all_contours_original": [],
         "accepted_source_contours_original": [],
         "bg_color": None,
         "raw_contours_count": 0,
         "accepted_count": 0,
+        "contour_mask": "?",
     }
+
+
+def make_piece_debug(
+    distance_map,
+    raw_mask,
+    clean_mask,
+    split_mask,
+    all_contours,
+    accepted_source_contours,
+    accepted_contours,
+    matrix,
+    bg_color,
+    contour_mask_name,
+    accepted_count,
+):
+    debug = make_empty_piece_debug()
+    debug["bg_color"] = bg_color
+    debug["raw_contours_count"] = len(all_contours)
+    debug["accepted_count"] = accepted_count
+    debug["contour_mask"] = contour_mask_name
+
+    if DISPLAY_MODE == 2:
+        if DEBUG_SHOW_ORIGINAL_PROCESS:
+            debug["distance_map_original"] = distance_map
+        else:
+            debug["distance_map"] = cv2.warpPerspective(distance_map.astype(np.float32), matrix, (WARP_W, WARP_H))
+
+    if DISPLAY_MODE == 3:
+        if DEBUG_SHOW_ORIGINAL_PROCESS:
+            debug["raw_mask_original"] = raw_mask
+        else:
+            debug["raw_mask"] = cv2.warpPerspective(raw_mask, matrix, (WARP_W, WARP_H), flags=cv2.INTER_NEAREST)
+
+    if DISPLAY_MODE == 4:
+        if PIECE_SPLIT_TOUCHING_ENABLED:
+            if DEBUG_SHOW_ORIGINAL_PROCESS:
+                debug["split_mask_original"] = split_mask
+            else:
+                debug["split_mask"] = cv2.warpPerspective(split_mask, matrix, (WARP_W, WARP_H), flags=cv2.INTER_NEAREST)
+        else:
+            if DEBUG_SHOW_ORIGINAL_PROCESS:
+                debug["clean_mask_original"] = clean_mask
+            else:
+                debug["clean_mask"] = cv2.warpPerspective(clean_mask, matrix, (WARP_W, WARP_H), flags=cv2.INTER_NEAREST)
+
+    if DISPLAY_MODE == 5:
+        if DEBUG_SHOW_ORIGINAL_PROCESS:
+            debug["all_contours_original"] = all_contours
+        else:
+            debug["all_contours"] = warp_contours(all_contours, matrix)
+
+    if DISPLAY_MODE == 6:
+        if DEBUG_SHOW_ORIGINAL_PROCESS:
+            debug["accepted_source_contours_original"] = accepted_source_contours
+        else:
+            debug["accepted_source_contours"] = warp_contours(accepted_source_contours, matrix)
+
+    debug["accepted_contours"] = accepted_contours
+    return debug
+
+
+def crop_to_mask_roi(frame, detect_mask):
+    if not PIECE_PROCESS_A4_ROI:
+        return frame, detect_mask, None
+
+    nonzero = cv2.findNonZero(detect_mask)
+    if nonzero is None:
+        return frame, detect_mask, None
+
+    x, y, w, h = cv2.boundingRect(nonzero)
+    return frame[y:y + h, x:x + w], detect_mask[y:y + h, x:x + w], (x, y, w, h)
+
+
+def offset_contours_from_roi(contours, roi):
+    if roi is None:
+        return contours
+
+    x, y, _, _ = roi
+    offset = np.array([[[x, y]]], dtype=np.int32)
+    return [contour + offset for contour in contours]
+
+
+def expand_debug_images_from_roi(distance_map, raw_mask, clean_mask, split_mask, roi, shape):
+    if roi is None or not DEBUG_SHOW_ORIGINAL_PROCESS or DISPLAY_MODE not in (2, 3, 4):
+        return distance_map, raw_mask, clean_mask, split_mask
+
+    return (
+        expand_roi_image(distance_map, roi, shape, np.float32),
+        expand_roi_image(raw_mask, roi, shape, np.uint8),
+        expand_roi_image(clean_mask, roi, shape, np.uint8),
+        expand_roi_image(split_mask, roi, shape, np.uint8),
+    )
+
+
+def expand_roi_image(image_roi, roi, shape, dtype):
+    x, y, w, h = roi
+    image = np.zeros(shape, dtype=dtype)
+    image[y:y + h, x:x + w] = image_roi
+    return image
+
+
+def make_piece_mask(frame, detect_mask):
+    if PIECE_MASK_METHOD == "hsv":
+        return make_piece_mask_hsv(frame, detect_mask)
+    return make_piece_mask_lab(frame, detect_mask)
+
+
+def make_piece_mask_hsv(frame, detect_mask):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    distance_map = hsv_outside_green_distance(hsv)
+    distance_map = smooth_distance_map(distance_map, detect_mask)
+    piece_mask = np.where(distance_map > PIECE_HSV_DIFF_THRESHOLD, 255, 0).astype(np.uint8)
+    piece_mask = cv2.bitwise_and(piece_mask, detect_mask)
+    piece_mask = smooth_piece_mask(piece_mask, detect_mask)
+
+    if DISPLAY_MODE != 2:
+        distance_map = np.zeros(piece_mask.shape, dtype=np.float32)
+    bg_color = np.array([PIECE_GREEN_H_LOW, PIECE_GREEN_S_LOW, PIECE_GREEN_V_LOW], dtype=np.float32)
+    return distance_map, piece_mask, bg_color
+
+
+def hsv_outside_green_distance(hsv):
+    hsv_float = hsv.astype(np.float32)
+    h = hsv_float[:, :, 0]
+    s = hsv_float[:, :, 1]
+    v = hsv_float[:, :, 2]
+
+    h_dist = np.maximum(np.maximum(PIECE_GREEN_H_LOW - h, h - PIECE_GREEN_H_HIGH), 0.0)
+    s_dist = np.maximum(np.maximum(PIECE_GREEN_S_LOW - s, s - PIECE_GREEN_S_HIGH), 0.0)
+    v_dist = np.maximum(np.maximum(PIECE_GREEN_V_LOW - v, v - PIECE_GREEN_V_HIGH), 0.0)
+    return np.sqrt(h_dist * h_dist + s_dist * s_dist + v_dist * v_dist)
+
+
+def smooth_distance_map(distance_map, detect_mask):
+    distance_map = distance_map * (detect_mask.astype(np.float32) / 255.0)
+    if PIECE_HSV_DIFF_BLUR_KERNEL[0] <= 1 or PIECE_HSV_DIFF_BLUR_KERNEL[1] <= 1:
+        return distance_map
+
+    blurred = cv2.GaussianBlur(distance_map, PIECE_HSV_DIFF_BLUR_KERNEL, 0)
+    return blurred * (detect_mask.astype(np.float32) / 255.0)
+
+
+def make_piece_mask_lab(frame, detect_mask):
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    bg_color = estimate_background_lab(lab, detect_mask)
+    diff = lab.astype(np.float32) - bg_color.reshape(1, 1, 3)
+    distance_weights = np.array(
+        [PIECE_L_DIFF_WEIGHT, PIECE_A_DIFF_WEIGHT, PIECE_B_DIFF_WEIGHT],
+        dtype=np.float32,
+    ).reshape(1, 1, 3)
+    distance_map = np.sqrt(np.sum(diff * diff * distance_weights, axis=2))
+    raw_mask = np.where(distance_map > PIECE_BG_DIFF_THRESHOLD, 255, 0).astype(np.uint8)
+    raw_mask = cv2.bitwise_and(raw_mask, detect_mask)
+    raw_mask = smooth_piece_mask(raw_mask, detect_mask)
+    return distance_map, raw_mask, bg_color
+
+
+def smooth_piece_mask(mask, detect_mask):
+    if PIECE_MASK_MEDIAN_KERNEL <= 1:
+        return mask
+
+    kernel = PIECE_MASK_MEDIAN_KERNEL
+    if kernel % 2 == 0:
+        kernel += 1
+    smoothed = cv2.medianBlur(mask, kernel)
+    return cv2.bitwise_and(smoothed, detect_mask)
+
+
+def split_touching_piece_mask(raw_mask, detect_mask):
+    if not PIECE_SPLIT_TOUCHING_ENABLED:
+        return raw_mask
+
+    kernel = np.ones(PIECE_SPLIT_ERODE_KERNEL, np.uint8)
+    split_mask = cv2.erode(raw_mask, kernel, iterations=PIECE_SPLIT_ERODE_ITERATIONS)
+    split_mask = cv2.bitwise_and(split_mask, detect_mask)
+    return split_mask
 
 
 def first_question_template_scores(contour):
@@ -519,6 +760,366 @@ def assign_first_question_templates(pieces):
         piece["template_area_ratio"] = area_ratio
         piece["template_target_area_ratio"] = template_ratios[template_index]
         piece["template_points"] = len(template["polygon_cm"])
+        piece.pop("template_scores", None)
+
+
+def attach_first_question_targets(pieces):
+    target_side = choose_first_question_target_side(pieces)
+    final_layout = first_question_target_layout(target_side, use_place_margin=False)
+    preview_layout = first_question_target_layout(target_side, use_place_margin=True)
+    for piece in pieces:
+        template_name = piece.get("template")
+        if not template_name or template_name not in final_layout:
+            continue
+
+        target = preview_layout[template_name]
+        final_target = final_layout[template_name]
+        piece["target_side"] = target_side
+        current_angle = polygon_longest_edge_angle(piece.get("polygon", []))
+        target_angle = polygon_longest_edge_angle(final_target["polygon"])
+        rotate_deg = normalize_undirected_angle_delta(target_angle - current_angle)
+        piece["current_angle"] = round(current_angle, 1)
+        piece["target_polygon"] = target["polygon"]
+        piece["target_center"] = target["center"]
+        piece["final_polygon"] = final_target["polygon"]
+        piece["final_center"] = final_target["center"]
+        piece["target_angle"] = round(target_angle, 1)
+        piece["rotate_deg"] = round(rotate_deg, 1)
+        piece["move"] = {
+            "pick": piece.get("center", [0, 0]),
+            "place": target["center"],
+            "final_place": final_target["center"],
+            "rotate_deg": round(rotate_deg, 1),
+        }
+
+
+def choose_first_question_target_side(pieces):
+    if FIRST_Q_TARGET_SIDE in ("left", "right"):
+        return FIRST_Q_TARGET_SIDE
+
+    centers = [piece.get("center") for piece in pieces if piece.get("center")]
+    if not centers:
+        return "left"
+
+    mean_x = float(np.mean([center[0] for center in centers]))
+    return "left" if mean_x >= WARP_W * 0.5 else "right"
+
+
+def first_question_target_layout(target_side=None, use_place_margin=False):
+    origin_cm = first_question_target_origin_cm(target_side)
+    layout = {}
+    for template in FIRST_Q_TEMPLATES:
+        name = template["name"]
+        points_cm = orient_first_question_points(np.asarray(template["polygon_cm"], dtype=np.float32))
+        points_cm = points_cm + origin_cm.reshape(1, 2)
+        polygon = [cm_to_warp(point).tolist() for point in points_cm]
+        center = np.mean(np.asarray(polygon, dtype=np.float32), axis=0)
+        if use_place_margin:
+            safe_center = first_question_safe_place(center, target_side)
+            shift = np.asarray(safe_center, dtype=np.float32) - center
+            polygon = (np.asarray(polygon, dtype=np.float32) + shift.reshape(1, 2)).round().astype(np.int32).tolist()
+            center = np.asarray(safe_center, dtype=np.float32)
+        layout[name] = {
+            "polygon": [[int(x), int(y)] for x, y in polygon],
+            "center": [int(round(center[0])), int(round(center[1]))],
+        }
+    return layout
+
+
+def first_question_safe_place(target_center, target_side):
+    if FIRST_Q_PLACE_MARGIN_CM <= 0:
+        return target_center
+
+    target_origin_cm = first_question_target_origin_cm(target_side)
+    rect_w, rect_h = first_question_target_rect_size_cm()
+    rect_center_cm = target_origin_cm + np.array([rect_w * 0.5, rect_h * 0.5], dtype=np.float32)
+    rect_center = cm_to_warp(rect_center_cm).astype(np.float32)
+    center = np.asarray(target_center, dtype=np.float32)
+    direction = center - rect_center
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-6:
+        return target_center
+
+    margin_px = FIRST_Q_PLACE_MARGIN_CM * (WARP_W - 1) / A4_W_CM
+    safe = center + direction / norm * margin_px
+    safe[0] = max(0, min(WARP_W - 1, safe[0]))
+    safe[1] = max(0, min(WARP_H - 1, safe[1]))
+    return np.rint(safe).astype(np.int32).tolist()
+
+
+def first_question_target_origin_cm(target_side=None):
+    target_side = target_side or FIRST_Q_TARGET_SIDE
+    if target_side == "auto":
+        target_side = "left"
+    half_w = A4_W_CM * 0.5
+    rect_w, rect_h = first_question_target_rect_size_cm()
+    if target_side == "right":
+        x0 = half_w + (half_w - rect_w) * 0.5
+    else:
+        x0 = (half_w - rect_w) * 0.5
+    y0 = (A4_H_CM - rect_h) * 0.5
+    return np.array([x0, y0], dtype=np.float32)
+
+
+def first_question_target_rect_size_cm():
+    if FIRST_Q_TARGET_ORIENTATION == "portrait":
+        return FIRST_Q_RECT_H_CM, FIRST_Q_RECT_W_CM
+    return FIRST_Q_RECT_W_CM, FIRST_Q_RECT_H_CM
+
+
+def orient_first_question_points(points_cm):
+    if FIRST_Q_TARGET_ORIENTATION != "portrait":
+        return points_cm
+
+    # Rotate the 10x6 cm template clockwise into a 6x10 cm upright target.
+    oriented = np.zeros_like(points_cm, dtype=np.float32)
+    oriented[:, 0] = FIRST_Q_RECT_H_CM - points_cm[:, 1]
+    oriented[:, 1] = points_cm[:, 0]
+    return oriented
+
+
+def cm_to_warp(point_cm):
+    point = np.asarray(point_cm, dtype=np.float32)
+    x = point[0] * (WARP_W - 1) / A4_W_CM
+    y = point[1] * (WARP_H - 1) / A4_H_CM
+    return np.rint([x, y]).astype(np.int32)
+
+
+def polygon_longest_edge_angle(points):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points_array) < 2:
+        return 0.0
+
+    best_length = -1.0
+    best_angle = 0.0
+    for index in range(len(points_array)):
+        start = points_array[index]
+        end = points_array[(index + 1) % len(points_array)]
+        vec = end - start
+        length = float(np.linalg.norm(vec))
+        if length > best_length:
+            best_length = length
+            best_angle = math.degrees(math.atan2(float(vec[1]), float(vec[0])))
+    return normalize_angle_180(best_angle)
+
+
+def normalize_angle_180(angle):
+    while angle > 180.0:
+        angle -= 360.0
+    while angle <= -180.0:
+        angle += 360.0
+    return angle
+
+
+def normalize_undirected_angle_delta(angle):
+    angle = normalize_angle_180(angle)
+    while angle > 90.0:
+        angle -= 180.0
+    while angle <= -90.0:
+        angle += 180.0
+    return angle
+
+
+def build_move_plan(pieces):
+    plan = []
+    for piece in pieces:
+        move = piece.get("move")
+        if not move:
+            continue
+        pick = move["pick"]
+        place = move.get("final_place", move["place"])
+        plan.append({
+            "piece": piece.get("template", "?"),
+            "pick": pick,
+            "place": move["place"],
+            "final_place": place,
+            "pick_mech": warp_to_mech_point(pick),
+            "place_mech": warp_to_mech_point(place),
+            "rotate_deg": move["rotate_deg"],
+            "target_side": piece.get("target_side", "?"),
+        })
+    return plan
+
+
+def mech_calibration_matrix():
+    src = np.float32(
+        [
+            [0.0, 0.0],
+            [WARP_W - 1.0, 0.0],
+            [WARP_W - 1.0, WARP_H - 1.0],
+            [0.0, WARP_H - 1.0],
+        ]
+    )
+    dst = np.float32(MECH_CALIBRATION_POINTS)
+    return cv2.getPerspectiveTransform(src, dst)
+
+
+def warp_to_mech_point(point):
+    if not MECH_COORD_OUTPUT_ENABLED:
+        return [float(point[0]), float(point[1])]
+
+    matrix = mech_calibration_matrix()
+    src = np.float32([[[float(point[0]), float(point[1])]]])
+    dst = cv2.perspectiveTransform(src, matrix)[0][0]
+    return [float(dst[0]), float(dst[1])]
+
+
+def format_mech_value(value):
+    if MECH_COORD_DECIMALS <= 0:
+        return str(int(round(float(value))))
+    return ("%." + str(MECH_COORD_DECIMALS) + "f") % float(value)
+
+
+def piece_name_to_id(name):
+    if name == "A":
+        return 0
+    if name == "B":
+        return 1
+    if name == "C":
+        return 2
+    if name == "D":
+        return 3
+    return 9
+
+
+def format_rotate_value(angle_deg):
+    return str(int(round(float(angle_deg) * MECH_ROTATE_SCALE)))
+
+
+def move_plan_records(result):
+    if not result.get("status"):
+        return []
+
+    move_plan = result.get("move_plan", [])
+    if not move_plan:
+        return []
+
+    records = []
+    for move in sorted(move_plan, key=lambda item: item.get("piece", "?")):
+        piece_name = move.get("piece", "?")
+        pick_x, pick_y = move.get("pick_mech", move.get("pick", [0, 0]))
+        place_x, place_y = move.get("place_mech", move.get("final_place", move.get("place", [0, 0])))
+        rotate_deg = float(move.get("rotate_deg", 0.0))
+        records.append(
+            {
+                "name": piece_name,
+                "id": piece_name_to_id(piece_name),
+                "pick_x": int(round(float(pick_x))),
+                "pick_y": int(round(float(pick_y))),
+                "place_x": int(round(float(place_x))),
+                "place_y": int(round(float(place_y))),
+                "rotate_deg": rotate_deg,
+                "rotate_x10": int(round(rotate_deg * MECH_ROTATE_SCALE)),
+            }
+        )
+    return records
+
+
+def build_move_packet_text(result):
+    records = move_plan_records(result)
+    if not records:
+        return None
+
+    fields = ["MV", str(len(records))]
+    for record in records:
+        fields.extend(
+            [
+                str(record["id"]),
+                str(record["pick_x"]),
+                str(record["pick_y"]),
+                str(record["place_x"]),
+                str(record["place_y"]),
+                str(record["rotate_x10"]),
+            ]
+        )
+    return " ".join(fields)
+
+
+def build_move_packet_binary(result):
+    records = move_plan_records(result)
+    if not records:
+        return None
+
+    payload = bytearray()
+    payload.append(len(records))
+    for record in records:
+        payload.extend(
+            struct.pack(
+                "<Bhhhhh",
+                record["id"],
+                record["pick_x"],
+                record["pick_y"],
+                record["place_x"],
+                record["place_y"],
+                record["rotate_x10"],
+            )
+        )
+
+    length = len(payload)
+    checksum = (length + sum(payload)) & 0xFF
+    packet = bytearray([0xAA, 0x55, length])
+    packet.extend(payload)
+    packet.append(checksum)
+    return bytes(packet)
+
+
+def build_move_packet_log(result):
+    records = move_plan_records(result)
+    if not records:
+        return None
+
+    parts = ["MOVES %d" % len(records)]
+    for record in records:
+        parts.append(
+            "%s pick=(%d,%d) place=(%d,%d) rot=%.1f"
+            % (
+                record["name"],
+                record["pick_x"],
+                record["pick_y"],
+                record["place_x"],
+                record["place_y"],
+                record["rotate_deg"],
+            )
+        )
+    return " | ".join(parts)
+
+
+def send_text(serial_obj, line):
+    print(line)
+    if serial_obj is None:
+        return
+
+    payload = (line + "\n").encode("utf-8")
+    try:
+        serial_obj.write(payload)
+    except Exception as err:
+        print("UART WRITE FAIL %s" % err)
+
+
+def send_binary(serial_obj, packet, log_line=None):
+    if log_line:
+        print(log_line)
+    else:
+        print("TX %d bytes" % len(packet))
+    if serial_obj is None:
+        return
+
+    try:
+        serial_obj.write(packet)
+    except Exception as err:
+        print("UART WRITE FAIL %s" % err)
+
+
+def send_move_packet(result, serial_obj):
+    if SERIAL_BINARY_PACKET:
+        packet = build_move_packet_binary(result)
+        if packet:
+            send_binary(serial_obj, packet, build_move_packet_log(result))
+        return
+
+    packet = build_move_packet_text(result)
+    if packet:
+        send_text(serial_obj, packet)
 
 
 def get_template_shape_score(piece, template_index):
@@ -795,9 +1396,45 @@ def draw_pieces(frame, pieces, piece_contours):
         cv2.putText(frame, label, (cx + 5, max(12, cy - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BLUE, 1)
 
 
+def draw_first_question_targets(frame, pieces):
+    if not FIRST_QUESTION_MODE:
+        return
+
+    target_side = None
+    for piece in pieces or []:
+        if piece.get("target_side"):
+            target_side = piece["target_side"]
+            break
+    if target_side is None:
+        target_side = choose_first_question_target_side(pieces or [])
+    layout = first_question_target_layout(target_side, use_place_margin=True)
+    for name, target in layout.items():
+        polygon = np.asarray(target["polygon"], dtype=np.int32).reshape(-1, 1, 2)
+        cv2.drawContours(frame, [polygon], -1, CYAN, 1)
+        tx, ty = target["center"]
+        cv2.putText(frame, name, (tx + 4, max(12, ty - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
+
+    for piece in pieces or []:
+        if "target_center" not in piece:
+            continue
+        cx, cy = piece.get("center", [0, 0])
+        tx, ty = piece["target_center"]
+        cv2.line(frame, (int(cx), int(cy)), (int(tx), int(ty)), CYAN, 1)
+        cv2.circle(frame, (int(tx), int(ty)), 3, CYAN, -1)
+
+
 def draw_piece_debug_info(frame, result, fps, piece_debug):
     draw_text_bg(frame, 8, 24, "A4 OK  FPS:%d" % fps, GREEN, 0.7)
-    draw_text_bg(frame, 8, 46, "mode:%d thr:%d" % (DISPLAY_MODE, int(PIECE_BG_DIFF_THRESHOLD)), WHITE, 0.5)
+    if PIECE_MASK_METHOD == "hsv":
+        mask_info = "mode:%d HSV H:%d-%d thr:%d" % (
+            DISPLAY_MODE,
+            PIECE_GREEN_H_LOW,
+            PIECE_GREEN_H_HIGH,
+            int(PIECE_HSV_DIFF_THRESHOLD),
+        )
+    else:
+        mask_info = "mode:%d LAB thr:%d" % (DISPLAY_MODE, int(PIECE_BG_DIFF_THRESHOLD))
+    draw_text_bg(frame, 8, 46, mask_info, WHITE, 0.5)
     draw_text_bg(
         frame,
         8,
@@ -821,6 +1458,19 @@ def draw_piece_debug_info(frame, result, fps, piece_debug):
         WHITE,
         0.5,
     )
+    if PIECE_MASK_METHOD == "hsv":
+        detail = "S:%d-%d V:%d-%d blur:%dx%d med:%d" % (
+            PIECE_GREEN_S_LOW,
+            PIECE_GREEN_S_HIGH,
+            PIECE_GREEN_V_LOW,
+            PIECE_GREEN_V_HIGH,
+            PIECE_HSV_DIFF_BLUR_KERNEL[0],
+            PIECE_HSV_DIFF_BLUR_KERNEL[1],
+            PIECE_MASK_MEDIAN_KERNEL,
+        )
+    else:
+        detail = "lw:%.2f" % PIECE_L_DIFF_WEIGHT
+    draw_text_bg(frame, 8, 106, "cnt_mask:%s %s" % (piece_debug.get("contour_mask", "?"), detail), WHITE, 0.5)
 
 
 def gray_to_bgr(gray):
@@ -832,7 +1482,11 @@ def gray_to_bgr(gray):
 def distance_map_to_view(distance_map):
     if distance_map is None:
         return np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    view_gray = np.clip(distance_map * (255.0 / max(1.0, PIECE_BG_DIFF_THRESHOLD * 2.0)), 0, 255).astype(np.uint8)
+    if PIECE_MASK_METHOD == "hsv":
+        max_value = max(1.0, float(np.percentile(distance_map, 98)))
+        view_gray = np.clip(distance_map * (255.0 / max_value), 0, 255).astype(np.uint8)
+    else:
+        view_gray = np.clip(distance_map * (255.0 / max(1.0, PIECE_BG_DIFF_THRESHOLD * 2.0)), 0, 255).astype(np.uint8)
     return cv2.cvtColor(view_gray, cv2.COLOR_GRAY2BGR)
 
 
@@ -860,7 +1514,10 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
         return view
 
     if result.get("status") and DISPLAY_MODE == 4:
-        key_name = "clean_mask_original" if DEBUG_SHOW_ORIGINAL_PROCESS else "clean_mask"
+        if PIECE_SPLIT_TOUCHING_ENABLED:
+            key_name = "split_mask_original" if DEBUG_SHOW_ORIGINAL_PROCESS else "split_mask"
+        else:
+            key_name = "clean_mask_original" if DEBUG_SHOW_ORIGINAL_PROCESS else "clean_mask"
         view = gray_to_bgr(piece_debug.get(key_name))
         draw_piece_debug_info(view, result, fps, piece_debug)
         return view
@@ -883,6 +1540,7 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
         else:
             view = a4_warp.copy() if a4_warp is not None else warp_a4(frame, result["corners"])[0]
             cv2.drawContours(view, piece_debug.get("accepted_source_contours", []), -1, RED, 1)
+            draw_first_question_targets(view, pieces or [])
             draw_pieces(view, pieces or [], piece_contours or [])
             draw_warp_result(view, result, fps)
         draw_piece_debug_info(view, result, fps, piece_debug)
@@ -890,6 +1548,7 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
 
     if DISPLAY_MODE == 1 and result.get("status"):
         view = a4_warp.copy() if a4_warp is not None else warp_a4(frame, result["corners"])[0]
+        draw_first_question_targets(view, pieces or [])
         draw_pieces(view, pieces or [], piece_contours or [])
         draw_warp_result(view, result, fps)
         return view
@@ -914,6 +1573,17 @@ def create_camera():
         return camera.Camera(FRAME_WIDTH, FRAME_HEIGHT)
 
 
+def create_serial():
+    if not SERIAL_OUTPUT_ENABLED or uart is None:
+        return None
+
+    try:
+        return uart.UART(SERIAL_PORT, SERIAL_BAUDRATE)
+    except Exception as err:
+        print("UART OPEN FAIL %s" % err)
+        return None
+
+
 def main():
     cam = create_camera()
     try:
@@ -925,6 +1595,7 @@ def main():
     detector = A4Detector()
     stabilizer = A4ResultStabilizer(MAX_LOST_FRAMES)
     key_obj = key.Key(on_key) if ENABLE_KEY_EXIT else None
+    serial_obj = create_serial()
     last_print_ms = time.ticks_ms()
     last_fps_ms = last_print_ms
     frame_count = 0
@@ -946,6 +1617,8 @@ def main():
             result = result.copy()
             result["pieces_count"] = len(pieces)
             result["pieces"] = pieces
+            if FIRST_QUESTION_MODE:
+                result["move_plan"] = build_move_plan(pieces)
 
         now = time.ticks_ms()
         frame_count += 1
@@ -957,7 +1630,10 @@ def main():
         view = make_display_view(frame, result, fps, a4_warp, pieces, piece_contours, piece_debug)
 
         if now - last_print_ms >= PRINT_INTERVAL_MS:
-            print(result)
+            if PRINT_MOVE_ONLY:
+                send_move_packet(result, serial_obj)
+            else:
+                print(result)
             last_print_ms = now
 
         disp.show(image.cv2image(view, bgr=True, copy=True))
