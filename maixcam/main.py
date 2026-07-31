@@ -41,7 +41,7 @@ MAX_LOST_FRAMES = 5
 
 PIECE_DETECTION_ENABLED = True
 FIRST_QUESTION_MODE = True
-PIECE_MASK_METHOD = "hsv"
+PIECE_MASK_METHOD = "black"
 PIECE_PROCESS_A4_ROI = True
 PIECE_BG_BORDER_SAMPLE = 24
 PIECE_BG_DIFF_THRESHOLD = 35.0
@@ -56,6 +56,9 @@ PIECE_GREEN_V_LOW = 75
 PIECE_GREEN_V_HIGH = 255
 PIECE_HSV_DIFF_THRESHOLD = 35.0
 PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)
+PIECE_BLACK_V_MIN_THRESHOLD = 120
+PIECE_BLACK_V_OFFSET = 85
+PIECE_BLACK_BLUR_KERNEL = (3, 3)
 PIECE_MASK_MEDIAN_KERNEL = 3
 PIECE_MASK_OPEN_KERNEL = (3, 3)
 PIECE_MASK_CLOSE_KERNEL = (3, 3)
@@ -67,10 +70,10 @@ PIECE_SPLIT_TOUCHING_ENABLED = False
 PIECE_SPLIT_ERODE_KERNEL = (3, 3)
 PIECE_SPLIT_ERODE_ITERATIONS = 3
 PIECE_USE_CONVEX_HULL = True
-PIECE_APPROX_EPSILON_RATIO = 0.02
-PIECE_APPROX_EPSILON_STEP = 0.005
-PIECE_APPROX_EPSILON_MAX = 0.06
-PIECE_MIN_EDGE_LENGTH_RATIO = 0.055
+PIECE_APPROX_EPSILON_RATIO = 0.008
+PIECE_APPROX_EPSILON_STEP = 0.003
+PIECE_APPROX_EPSILON_MAX = 0.035
+PIECE_MIN_EDGE_LENGTH_RATIO = 0.025
 PIECE_REFINE_CORNERS_BY_LINES = True
 PIECE_LINE_FIT_TRIM_RATIO = 0.18
 PIECE_MAX_POINTS = 5
@@ -81,18 +84,21 @@ PIECE_BORDER_MARGIN = 8
 PIECE_FRAME_MASK_MARGIN = 6
 PIECE_MIN_BBOX_SIDE = 8
 PIECE_MAX_ASPECT_RATIO = 8.0
+PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.40
 
 FIRST_Q_RECT_W_CM = 10.0
 FIRST_Q_RECT_H_CM = 6.0
 FIRST_Q_TARGET_SIDE = "auto"
 FIRST_Q_TARGET_ORIENTATION = "portrait"
-FIRST_Q_PLACE_MARGIN_CM = 0.6
+FIRST_Q_PLACE_MARGIN_CM = 0.0
 FIRST_Q_DIAG_A = [2.0, 0.0]
 FIRST_Q_DIAG_P = [3.6, 1.2]
 FIRST_Q_DIAG_Q = [7.6, 4.2]
 FIRST_Q_MATCH_SHAPE_WEIGHT = 1.0
 FIRST_Q_MATCH_AREA_WEIGHT = 4.0
 FIRST_Q_MATCH_POINT_WEIGHT = 0.08
+ROTATION_MATCH_SAMPLE_COUNT = 32
+ROTATION_MATCH_MAX_CANDIDATES = 12
 
 FIRST_Q_TEMPLATES = [
     {"name": "A", "polygon_cm": [[0.0, 0.0], FIRST_Q_DIAG_A, FIRST_Q_DIAG_P, [0.0, 2.0]]},
@@ -110,15 +116,29 @@ PRINT_INTERVAL_MS = 500
 PRINT_MOVE_ONLY = True
 SHOW_DEBUG_INFO = False
 ENABLE_KEY_EXIT = True
+SEND_SERIAL_ON_KEY_PRESS = True
+PERF_PROFILE = True
+CAPTURE_FRAME_COUNT = 60
+CAPTURE_HOLD_MS = 65000
+CAPTURE_MIN_VALID_FRAMES = 2
+CAPTURE_OUTLIER_A4_CORNER_PX = 25.0
+CAPTURE_OUTLIER_CENTER_PX = 35.0
+CAPTURE_OUTLIER_ROTATE_DEG = 25.0
 
 SERIAL_OUTPUT_ENABLED = True
 SERIAL_PORT = "/dev/ttyS4"
 SERIAL_BAUDRATE = 115200
-SERIAL_BINARY_PACKET = True
+SERIAL_OUTPUT_FORMAT = "binary"  # gcode, binary, text
+GCODE_FEEDRATE = 3000
+GCODE_TRAVEL_FEEDRATE = 5000
+GCODE_PEN_UP_Z = 5.0
+GCODE_PEN_DOWN_Z = 0.0
+GCODE_ROTATE_AXIS = "A"
 
 # 机械坐标标定点，顺序是标准 A4 透视图里的 TL/TR/BR/BL。
 # 默认值表示以 A4 左上角为机械原点，单位 mm；实车标定时改成机械端实测坐标。
 MECH_COORD_OUTPUT_ENABLED = True
+MECH_SWAP_XY_FOR_STM32 = True
 MECH_COORD_DECIMALS = 0
 MECH_ROTATE_SCALE = 10.0
 MECH_CALIBRATION_POINTS = [
@@ -143,6 +163,12 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 BLUE = (255, 0, 0)
 CYAN = (255, 255, 0)
+
+capture_requested = False
+first_question_area_ratios_cache = None
+first_question_template_contour_cache = {}
+first_question_target_layout_cache = {}
+rotation_target_sample_cache = {}
 
 
 # =========================
@@ -207,7 +233,7 @@ def standard_midline():
     return [[x, 0], [x, WARP_H - 1]]
 
 
-def warp_a4(frame, corners):
+def a4_perspective_matrices(corners):
     src = np.float32(corners)
     dst = np.float32(
         [
@@ -219,6 +245,11 @@ def warp_a4(frame, corners):
     )
     matrix = cv2.getPerspectiveTransform(src, dst)
     inverse_matrix = cv2.getPerspectiveTransform(dst, src)
+    return matrix, inverse_matrix
+
+
+def warp_a4(frame, corners):
+    matrix, inverse_matrix = a4_perspective_matrices(corners)
     warped = cv2.warpPerspective(frame, matrix, (WARP_W, WARP_H))
     return warped, matrix, inverse_matrix
 
@@ -447,21 +478,29 @@ def detect_pieces(frame, corners, matrix):
             continue
 
         approx_warp = cv2.perspectiveTransform(approx.astype(np.float32), matrix).astype(np.int32)
-        center_warp = cv2.perspectiveTransform(np.float32([[[cx, cy]]]), matrix)[0][0]
         xw, yw, ww, hw = cv2.boundingRect(approx_warp)
+        area_warp = cv2.contourArea(approx_warp)
         polygon = approx_warp.reshape(-1, 2).astype(int).tolist()
-        cx_warp = int(center_warp[0])
-        cy_warp = int(center_warp[1])
-        template_scores = first_question_template_scores(approx) if FIRST_QUESTION_MODE else []
+        center_warp = contour_centroid(approx_warp)
+        if center_warp is None:
+            center_warp = cv2.perspectiveTransform(np.float32([[[cx, cy]]]), matrix)[0][0]
+            cx_warp = int(center_warp[0])
+            cy_warp = int(center_warp[1])
+        else:
+            cx_warp, cy_warp = center_warp
+        expanded_polygon = expand_polygon_about_center(polygon, [cx_warp, cy_warp], PIECE_TARGET_SHAPE_EXPAND_SCALE)
+        template_scores = first_question_template_scores(approx_warp) if FIRST_QUESTION_MODE else []
 
         piece = {
             "id": len(pieces),
-            "area": int(area),
+            "area": int(area_warp),
+            "source_area": int(area),
             "center": [cx_warp, cy_warp],
             "bbox": [int(xw), int(yw), int(ww), int(hw)],
             "side": "left" if cx_warp < WARP_W // 2 else "right",
             "points": len(approx_warp),
             "polygon": polygon,
+            "expanded_polygon": expanded_polygon,
         }
         if FIRST_QUESTION_MODE:
             piece["template_scores"] = template_scores
@@ -626,6 +665,8 @@ def expand_roi_image(image_roi, roi, shape, dtype):
 def make_piece_mask(frame, detect_mask):
     if PIECE_MASK_METHOD == "hsv":
         return make_piece_mask_hsv(frame, detect_mask)
+    if PIECE_MASK_METHOD == "black":
+        return make_piece_mask_black(frame, detect_mask)
     return make_piece_mask_lab(frame, detect_mask)
 
 
@@ -661,6 +702,38 @@ def smooth_distance_map(distance_map, detect_mask):
         return distance_map
 
     blurred = cv2.GaussianBlur(distance_map, PIECE_HSV_DIFF_BLUR_KERNEL, 0)
+    return blurred * (detect_mask.astype(np.float32) / 255.0)
+
+
+def make_piece_mask_black(frame, detect_mask):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    distance_map = hsv[:, :, 2].astype(np.float32)
+    distance_map = smooth_black_brightness(distance_map, detect_mask)
+    bg_v = estimate_black_background_v(distance_map, detect_mask)
+    threshold = max(float(PIECE_BLACK_V_MIN_THRESHOLD), bg_v + float(PIECE_BLACK_V_OFFSET))
+    piece_mask = np.where(distance_map > threshold, 255, 0).astype(np.uint8)
+    piece_mask = cv2.bitwise_and(piece_mask, detect_mask)
+    piece_mask = smooth_piece_mask(piece_mask, detect_mask)
+
+    if DISPLAY_MODE != 2:
+        distance_map = np.zeros(piece_mask.shape, dtype=np.float32)
+    bg_color = np.array([threshold, bg_v, 0.0], dtype=np.float32)
+    return distance_map, piece_mask, bg_color
+
+
+def estimate_black_background_v(distance_map, detect_mask):
+    samples = distance_map[detect_mask > 0]
+    if len(samples) == 0:
+        return 0.0
+    return float(np.percentile(samples, 20))
+
+
+def smooth_black_brightness(distance_map, detect_mask):
+    distance_map = distance_map * (detect_mask.astype(np.float32) / 255.0)
+    if PIECE_BLACK_BLUR_KERNEL[0] <= 1 or PIECE_BLACK_BLUR_KERNEL[1] <= 1:
+        return distance_map
+
+    blurred = cv2.GaussianBlur(distance_map, PIECE_BLACK_BLUR_KERNEL, 0)
     return blurred * (detect_mask.astype(np.float32) / 255.0)
 
 
@@ -707,7 +780,7 @@ def first_question_template_scores(contour):
     source = normalize_contour_for_match(contour)
     scores = []
     for template_index, template in enumerate(FIRST_Q_TEMPLATES):
-        template_contour = template_contour_for_match(template["polygon_cm"])
+        template_contour = cached_template_contour_for_match(template_index)
         score = float(cv2.matchShapes(source, template_contour, cv2.CONTOURS_MATCH_I1, 0.0))
         scores.append({
             "index": template_index,
@@ -722,7 +795,7 @@ def assign_first_question_templates(pieces):
     if not pieces:
         return
 
-    template_ratios = first_question_template_area_ratios()
+    template_ratios = cached_first_question_template_area_ratios()
     total_area = max(1.0, float(sum(piece.get("area", 0) for piece in pieces)))
     piece_count = min(len(pieces), len(FIRST_Q_TEMPLATES))
     best_assignment = None
@@ -734,7 +807,7 @@ def assign_first_question_templates(pieces):
             piece = pieces[piece_index]
             shape_score = get_template_shape_score(piece, template_index)
             area_ratio = float(piece.get("area", 0)) / total_area
-            area_score = abs(area_ratio - template_ratios[template_index])
+            area_score = template_area_match_score(area_ratio, template_ratios[template_index])
             point_score = abs(int(piece.get("points", 0)) - len(FIRST_Q_TEMPLATES[template_index]["polygon_cm"]))
             cost += (
                 FIRST_Q_MATCH_SHAPE_WEIGHT * shape_score
@@ -751,7 +824,7 @@ def assign_first_question_templates(pieces):
     for piece_index, template_index in enumerate(best_assignment):
         piece = pieces[piece_index]
         area_ratio = float(piece.get("area", 0)) / total_area
-        area_score = abs(area_ratio - template_ratios[template_index])
+        area_score = template_area_match_score(area_ratio, template_ratios[template_index])
         shape_score = get_template_shape_score(piece, template_index)
         template = FIRST_Q_TEMPLATES[template_index]
         piece["template"] = template["name"]
@@ -763,33 +836,77 @@ def assign_first_question_templates(pieces):
         piece.pop("template_scores", None)
 
 
+def template_area_match_score(area_ratio, target_ratio):
+    area_ratio = max(1e-6, float(area_ratio))
+    target_ratio = max(1e-6, float(target_ratio))
+    return abs(math.log(area_ratio / target_ratio))
+
+
 def attach_first_question_targets(pieces):
     target_side = choose_first_question_target_side(pieces)
-    final_layout = first_question_target_layout(target_side, use_place_margin=False)
-    preview_layout = first_question_target_layout(target_side, use_place_margin=True)
+    final_layout = cached_first_question_target_layout(target_side, use_place_margin=False)
     for piece in pieces:
         template_name = piece.get("template")
         if not template_name or template_name not in final_layout:
             continue
 
-        target = preview_layout[template_name]
         final_target = final_layout[template_name]
         piece["target_side"] = target_side
-        current_angle = polygon_longest_edge_angle(piece.get("polygon", []))
+        raw_polygon = piece.get("polygon", [])
+        current_polygon = piece.get("expanded_polygon", raw_polygon)
+        current_angle = polygon_longest_edge_angle(current_polygon)
         target_angle = polygon_longest_edge_angle(final_target["polygon"])
-        rotate_deg = normalize_undirected_angle_delta(target_angle - current_angle)
+        rotate_deg = estimate_piece_rotation_delta(template_name, current_polygon, final_target["polygon"])
+        if rotate_deg is None:
+            target_sampled = cached_rotation_target_sample(final_target["polygon"])
+            rotate_deg = estimate_polygon_rotation_delta(current_polygon, final_target["polygon"], target_sampled)
+            if rotate_deg is None:
+                rotate_deg = choose_directed_rotation_180(
+                    current_polygon,
+                    final_target["polygon"],
+                    target_angle - current_angle,
+                    target_sampled,
+                )
+                rotation_method = "edge"
+            else:
+                rotate_deg = choose_directed_rotation_180(
+                    current_polygon,
+                    final_target["polygon"],
+                    rotate_deg,
+                    target_sampled,
+                )
+                rotation_method = "shape180"
+        else:
+            rotate_deg = choose_directed_rotation_180(current_polygon, final_target["polygon"], rotate_deg)
+            rotation_method = "axisdir"
+        target_detected_polygon = place_detected_polygon_on_target(
+            current_polygon,
+            final_target["polygon"],
+            rotate_deg,
+        )
+        final_detected_polygon = place_detected_polygon_on_target(
+            current_polygon,
+            final_target["polygon"],
+            rotate_deg,
+        )
+        detected_target_center = polygon_center(target_detected_polygon)
+        detected_final_center = polygon_center(final_detected_polygon)
         piece["current_angle"] = round(current_angle, 1)
-        piece["target_polygon"] = target["polygon"]
-        piece["target_center"] = target["center"]
+        piece["target_polygon"] = final_target["polygon"]
+        piece["target_center"] = detected_target_center
+        piece["target_detected_polygon"] = target_detected_polygon
         piece["final_polygon"] = final_target["polygon"]
-        piece["final_center"] = final_target["center"]
+        piece["final_center"] = detected_final_center
+        piece["final_detected_polygon"] = final_detected_polygon
         piece["target_angle"] = round(target_angle, 1)
         piece["rotate_deg"] = round(rotate_deg, 1)
+        piece["rotate_method"] = rotation_method
         piece["move"] = {
             "pick": piece.get("center", [0, 0]),
-            "place": target["center"],
-            "final_place": final_target["center"],
+            "place": detected_target_center,
+            "final_place": detected_final_center,
             "rotate_deg": round(rotate_deg, 1),
+            "rotate_method": rotation_method,
         }
 
 
@@ -807,11 +924,16 @@ def choose_first_question_target_side(pieces):
 
 def first_question_target_layout(target_side=None, use_place_margin=False):
     origin_cm = first_question_target_origin_cm(target_side)
+    rect_w, rect_h = first_question_target_rect_size_cm()
+    target_rect_center_cm = origin_cm + np.array([rect_w * 0.5, rect_h * 0.5], dtype=np.float32)
     layout = {}
     for template in FIRST_Q_TEMPLATES:
         name = template["name"]
         points_cm = orient_first_question_points(np.asarray(template["polygon_cm"], dtype=np.float32))
         points_cm = points_cm + origin_cm.reshape(1, 2)
+        points_cm = target_rect_center_cm.reshape(1, 2) + (
+            points_cm - target_rect_center_cm.reshape(1, 2)
+        ) * float(PIECE_TARGET_SHAPE_EXPAND_SCALE)
         polygon = [cm_to_warp(point).tolist() for point in points_cm]
         center = np.mean(np.asarray(polygon, dtype=np.float32), axis=0)
         if use_place_margin:
@@ -824,6 +946,22 @@ def first_question_target_layout(target_side=None, use_place_margin=False):
             "center": [int(round(center[0])), int(round(center[1]))],
         }
     return layout
+
+
+def cached_first_question_target_layout(target_side=None, use_place_margin=False):
+    key = (
+        target_side or FIRST_Q_TARGET_SIDE,
+        bool(use_place_margin),
+        FIRST_Q_TARGET_ORIENTATION,
+        FIRST_Q_TARGET_SIDE,
+        float(FIRST_Q_PLACE_MARGIN_CM),
+        float(PIECE_TARGET_SHAPE_EXPAND_SCALE),
+    )
+    cached = first_question_target_layout_cache.get(key)
+    if cached is None:
+        cached = first_question_target_layout(target_side, use_place_margin)
+        first_question_target_layout_cache[key] = cached
+    return cached
 
 
 def first_question_safe_place(target_center, target_side):
@@ -885,6 +1023,58 @@ def cm_to_warp(point_cm):
     return np.rint([x, y]).astype(np.int32)
 
 
+def expand_polygon_about_center(points, center, scale):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    center_array = np.asarray(center, dtype=np.float32).reshape(1, 2)
+    expanded = center_array + (points_array - center_array) * float(scale)
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, WARP_W - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, WARP_H - 1)
+    return np.rint(expanded).astype(np.int32).tolist()
+
+
+def place_detected_polygon_on_target(points, target_points, rotate_deg):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    target_array = np.asarray(target_points, dtype=np.float32).reshape(-1, 2)
+    source_sampled = resample_closed_polygon(points_array, ROTATION_MATCH_SAMPLE_COUNT)
+    target_sampled = resample_closed_polygon(target_array, ROTATION_MATCH_SAMPLE_COUNT)
+    if source_sampled is None:
+        source_center = np.mean(points_array, axis=0).reshape(1, 2)
+    else:
+        source_center = np.mean(source_sampled, axis=0).reshape(1, 2)
+    if target_sampled is None:
+        target_center = np.mean(target_array, axis=0).reshape(1, 2)
+    else:
+        target_center = np.mean(target_sampled, axis=0).reshape(1, 2)
+
+    centered = points_array - source_center
+    rotated = rotate_points_clockwise(centered, rotate_deg)
+    placed = rotated + target_center
+    placed[:, 0] = np.clip(placed[:, 0], 0, WARP_W - 1)
+    placed[:, 1] = np.clip(placed[:, 1], 0, WARP_H - 1)
+    return np.rint(placed).astype(np.int32).tolist()
+
+
+def polygon_center(points):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points_array) == 0:
+        return [0, 0]
+    centroid = contour_centroid(points_array.astype(np.int32).reshape(-1, 1, 2))
+    if centroid is not None:
+        return centroid
+    center = np.mean(points_array, axis=0)
+    return [int(round(float(center[0]))), int(round(float(center[1])))]
+
+
+def contour_centroid(contour):
+    moments = cv2.moments(contour)
+    if abs(moments["m00"]) <= 1e-6:
+        return None
+    return [
+        int(round(moments["m10"] / moments["m00"])),
+        int(round(moments["m01"] / moments["m00"])),
+    ]
+
+
 def polygon_longest_edge_angle(points):
     points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
     if len(points_array) < 2:
@@ -903,20 +1093,256 @@ def polygon_longest_edge_angle(points):
     return normalize_angle_180(best_angle)
 
 
+def estimate_piece_rotation_delta(template_name, source_points, target_points):
+    if template_name not in ("A", "B", "C"):
+        return None
+
+    source_angle = polygon_principal_axis_angle(source_points)
+    target_angle = polygon_principal_axis_angle(target_points)
+    if source_angle is None or target_angle is None:
+        return None
+    return target_angle - source_angle
+
+
+def choose_directed_rotation_180(source_points, target_points, rotation_delta, target_sampled=None):
+    source_sampled = resample_closed_polygon(np.asarray(source_points, dtype=np.float32), ROTATION_MATCH_SAMPLE_COUNT)
+    if target_sampled is None:
+        target_sampled = resample_closed_polygon(np.asarray(target_points, dtype=np.float32), ROTATION_MATCH_SAMPLE_COUNT)
+    else:
+        target_sampled = np.asarray(target_sampled, dtype=np.float32).reshape(-1, 2)
+    if source_sampled is None or target_sampled is None:
+        return normalize_angle_180(rotation_delta)
+
+    source_centered = source_sampled - np.mean(source_sampled, axis=0)
+    target_centered = target_sampled - np.mean(target_sampled, axis=0)
+    base_angle = normalize_angle_180(rotation_delta)
+    flipped_angle = normalize_angle_180(rotation_delta + 180.0)
+    base_score = score_directed_rotation(source_points, target_points, source_centered, target_centered, base_angle)
+    flipped_score = score_directed_rotation(source_points, target_points, source_centered, target_centered, flipped_angle)
+    if flipped_score < base_score:
+        return flipped_angle
+    return base_angle
+
+
+def choose_directed_axis_rotation(source_points, target_points, axis_delta):
+    return choose_directed_rotation_180(source_points, target_points, axis_delta)
+
+
+def score_directed_rotation(source_points, target_points, source_centered, target_centered, angle):
+    boundary_score = score_rotation_by_boundary_distance(source_centered, target_centered, angle)
+    feature_score = score_rotation_by_feature_direction(source_points, target_points, angle)
+    return boundary_score + feature_score
+
+
+def score_rotation_by_feature_direction(source_points, target_points, angle):
+    source_vector = polygon_feature_vector(source_points)
+    target_vector = polygon_feature_vector(target_points)
+    if source_vector is None or target_vector is None:
+        return 0.0
+    rotated_vector = rotate_points_clockwise(np.asarray([source_vector], dtype=np.float32), angle)[0]
+    source_norm = float(np.linalg.norm(rotated_vector))
+    target_norm = float(np.linalg.norm(target_vector))
+    if source_norm <= 1e-6 or target_norm <= 1e-6:
+        return 0.0
+    rotated_vector = rotated_vector / source_norm
+    target_vector = target_vector / target_norm
+    return float(np.sum((rotated_vector - target_vector) * (rotated_vector - target_vector))) * 2000.0
+
+
+def polygon_feature_vector(points):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points_array) < 3:
+        return None
+
+    center = np.mean(points_array, axis=0)
+    best_index = None
+    best_score = None
+    for index in range(len(points_array)):
+        prev_point = points_array[(index - 1) % len(points_array)]
+        point = points_array[index]
+        next_point = points_array[(index + 1) % len(points_array)]
+        interior = angle_at(prev_point, point, next_point)
+        radius = float(np.linalg.norm(point - center))
+        score = interior - radius * 0.02
+        if best_score is None or score < best_score:
+            best_score = score
+            best_index = index
+    if best_index is None:
+        return None
+    return points_array[best_index] - center
+
+
+def polygon_principal_axis_angle(points):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points_array) < 3:
+        return None
+
+    centered = points_array - np.mean(points_array, axis=0)
+    xx = float(np.sum(centered[:, 0] * centered[:, 0]))
+    yy = float(np.sum(centered[:, 1] * centered[:, 1]))
+    xy = float(np.sum(centered[:, 0] * centered[:, 1]))
+    if xx + yy <= 1e-6:
+        return None
+
+    return 0.5 * math.degrees(math.atan2(2.0 * xy, xx - yy))
+
+
+def estimate_polygon_rotation_delta(source_points, target_points, target_sampled=None):
+    source = np.asarray(source_points, dtype=np.float32).reshape(-1, 2)
+    target = np.asarray(target_points, dtype=np.float32).reshape(-1, 2)
+    if len(source) < 3 or len(target) < 3:
+        return None
+
+    sample_count = ROTATION_MATCH_SAMPLE_COUNT
+    source_sampled = resample_closed_polygon(source, sample_count)
+    if target_sampled is None:
+        target_sampled = resample_closed_polygon(target, sample_count)
+    else:
+        target_sampled = np.asarray(target_sampled, dtype=np.float32).reshape(-1, 2)
+    if source_sampled is None or target_sampled is None:
+        return None
+
+    source_centered = source_sampled - np.mean(source_sampled, axis=0)
+    if np.linalg.norm(source_centered) <= 1e-6:
+        return None
+    target_centered_sampled = target_sampled - np.mean(target_sampled, axis=0)
+    if np.linalg.norm(target_centered_sampled) <= 1e-6:
+        return None
+
+    best_angle = None
+    best_score = None
+    for angle in edge_alignment_angle_candidates(source, target)[:ROTATION_MATCH_MAX_CANDIDATES]:
+        score = score_rotation_by_boundary_distance(source_centered, target_centered_sampled, angle)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_angle = angle
+
+    if len(source) == len(target):
+        for candidate in polygon_order_variants(target):
+            target_centered = candidate - np.mean(candidate, axis=0)
+            if np.linalg.norm(target_centered) <= 1e-6:
+                continue
+
+            angle = rotation_angle_between_point_sets(source - np.mean(source, axis=0), target_centered)
+            score = score_rotation_by_boundary_distance(source_centered, target_centered_sampled, angle)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_angle = angle
+
+    if best_angle is None:
+        return None
+    return normalize_angle_180(best_angle)
+
+
+def edge_alignment_angle_candidates(source, target):
+    candidates = []
+    for source_a, source_b in polygon_edges(source):
+        source_vec = source_b - source_a
+        source_len = float(np.linalg.norm(source_vec))
+        if source_len <= 1e-6:
+            continue
+        source_angle = math.atan2(float(source_vec[1]), float(source_vec[0]))
+        for target_a, target_b in polygon_edges(target):
+            for first, second in ((target_a, target_b), (target_b, target_a)):
+                target_vec = second - first
+                target_len = float(np.linalg.norm(target_vec))
+                if target_len <= 1e-6:
+                    continue
+                length_ratio = source_len / target_len
+                if length_ratio < 0.35 or length_ratio > 2.85:
+                    continue
+                target_angle = math.atan2(float(target_vec[1]), float(target_vec[0]))
+                length_score = abs(math.log(max(1e-6, length_ratio)))
+                candidates.append((length_score, math.degrees(target_angle - source_angle)))
+    candidates.sort(key=lambda item: item[0])
+    return [angle for _score, angle in candidates]
+
+
+def polygon_edges(points):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    return [(points[index], points[(index + 1) % len(points)]) for index in range(len(points))]
+
+
+def score_rotation_by_boundary_distance(source_centered, target_centered, angle):
+    rotated = rotate_points_clockwise(source_centered, angle)
+    scale = optimal_point_set_scale(rotated, target_centered)
+    rotated = rotated * scale
+    forward = mean_nearest_point_distance_sq(rotated, target_centered)
+    backward = mean_nearest_point_distance_sq(target_centered, rotated)
+    return forward + backward
+
+
+def mean_nearest_point_distance_sq(points, candidates):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    candidates = np.asarray(candidates, dtype=np.float32).reshape(-1, 2)
+    diffs = points[:, None, :] - candidates[None, :, :]
+    distances = np.sum(diffs * diffs, axis=2)
+    return float(np.mean(np.min(distances, axis=1)))
+
+
+def resample_closed_polygon(points, sample_count):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 3 or sample_count < 3:
+        return None
+
+    next_points = np.roll(points, -1, axis=0)
+    edge_vectors = next_points - points
+    edge_lengths = np.linalg.norm(edge_vectors, axis=1)
+    perimeter = float(np.sum(edge_lengths))
+    if perimeter <= 1e-6:
+        return None
+
+    distances = np.linspace(0.0, perimeter, sample_count, endpoint=False)
+    cumulative = np.concatenate(([0.0], np.cumsum(edge_lengths)))
+    sampled = []
+    edge_index = 0
+    for distance in distances:
+        while edge_index < len(edge_lengths) - 1 and distance >= cumulative[edge_index + 1]:
+            edge_index += 1
+        edge_length = max(1e-6, float(edge_lengths[edge_index]))
+        t = (distance - cumulative[edge_index]) / edge_length
+        sampled.append(points[edge_index] + edge_vectors[edge_index] * t)
+    return np.asarray(sampled, dtype=np.float32)
+
+
+def polygon_order_variants(points):
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    variants = []
+    for ordered in (points, points[::-1]):
+        for shift in range(len(ordered)):
+            variants.append(np.roll(ordered, -shift, axis=0))
+    return variants
+
+
+def rotation_angle_between_point_sets(source_centered, target_centered):
+    cross_sum = float(np.sum(source_centered[:, 0] * target_centered[:, 1] - source_centered[:, 1] * target_centered[:, 0]))
+    dot_sum = float(np.sum(source_centered[:, 0] * target_centered[:, 0] + source_centered[:, 1] * target_centered[:, 1]))
+    return math.degrees(math.atan2(cross_sum, dot_sum))
+
+
+def rotate_points_clockwise(points, angle_deg):
+    angle = math.radians(float(angle_deg))
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    matrix = np.array([[cosine, -sine], [sine, cosine]], dtype=np.float32)
+    return np.asarray(points, dtype=np.float32).dot(matrix.T)
+
+
+def optimal_point_set_scale(source_points, target_points):
+    denominator = float(np.sum(source_points * source_points))
+    if denominator <= 1e-6:
+        return 1.0
+    scale = float(np.sum(source_points * target_points)) / denominator
+    if scale <= 1e-6:
+        return 1.0
+    return scale
+
+
 def normalize_angle_180(angle):
     while angle > 180.0:
         angle -= 360.0
     while angle <= -180.0:
         angle += 360.0
-    return angle
-
-
-def normalize_undirected_angle_delta(angle):
-    angle = normalize_angle_180(angle)
-    while angle > 90.0:
-        angle -= 180.0
-    while angle <= -90.0:
-        angle += 180.0
     return angle
 
 
@@ -936,9 +1362,169 @@ def build_move_plan(pieces):
             "pick_mech": warp_to_mech_point(pick),
             "place_mech": warp_to_mech_point(place),
             "rotate_deg": move["rotate_deg"],
+            "rotate_method": move.get("rotate_method", "?"),
             "target_side": piece.get("target_side", "?"),
         })
     return plan
+
+
+def aggregate_capture_samples(samples):
+    valid_samples = [sample for sample in samples if sample.get("status") and sample.get("pieces")]
+    if len(valid_samples) < CAPTURE_MIN_VALID_FRAMES:
+        return None, []
+    valid_samples = filter_a4_capture_samples(valid_samples)
+    if len(valid_samples) < CAPTURE_MIN_VALID_FRAMES:
+        return None, []
+
+    grouped = {}
+    for sample in valid_samples:
+        for piece in sample.get("pieces", []):
+            template_name = piece.get("template")
+            if template_name:
+                grouped.setdefault(template_name, []).append(piece)
+
+    aggregated_pieces = []
+    for template_name in ("A", "B", "C", "D"):
+        pieces = grouped.get(template_name, [])
+        if len(pieces) < CAPTURE_MIN_VALID_FRAMES:
+            continue
+        filtered = filter_piece_samples(pieces)
+        if len(filtered) < CAPTURE_MIN_VALID_FRAMES:
+            continue
+        aggregated_pieces.append(average_piece_samples(template_name, filtered))
+
+    if len(aggregated_pieces) < min(PIECE_MAX_COUNT, len(FIRST_Q_TEMPLATES)):
+        return None, []
+
+    aggregated_pieces.sort(key=lambda piece: (piece["center"][1], piece["center"][0]))
+    for piece_id, piece in enumerate(aggregated_pieces):
+        piece["id"] = piece_id
+
+    corners = average_a4_corners(valid_samples)
+    result = {
+        "status": True,
+        "stable": True,
+        "corners": corners,
+        "midline": standard_midline(),
+        "pieces_count": len(aggregated_pieces),
+        "pieces": aggregated_pieces,
+        "move_plan": build_move_plan(aggregated_pieces),
+        "capture_frames": len(valid_samples),
+    }
+    piece_contours = [
+        np.asarray(piece["polygon"], dtype=np.int32).reshape(-1, 1, 2)
+        for piece in aggregated_pieces
+    ]
+    return result, piece_contours
+
+
+def filter_a4_capture_samples(samples):
+    corner_sets = [sample.get("corners") for sample in samples if sample.get("corners") is not None]
+    if len(corner_sets) < CAPTURE_MIN_VALID_FRAMES:
+        return []
+    corners = np.asarray(corner_sets, dtype=np.float32).reshape(-1, 4, 2)
+    median_corners = np.median(corners, axis=0)
+    filtered = []
+    for sample, sample_corners in zip(samples, corners):
+        corner_error = float(np.max(np.linalg.norm(sample_corners - median_corners, axis=1)))
+        if corner_error <= CAPTURE_OUTLIER_A4_CORNER_PX:
+            filtered.append(sample)
+    return filtered
+
+
+def average_a4_corners(samples):
+    corners = np.asarray([sample.get("corners") for sample in samples], dtype=np.float32).reshape(-1, 4, 2)
+    mean = np.mean(corners, axis=0)
+    return np.rint(mean).astype(np.int32).tolist()
+
+
+def filter_piece_samples(pieces):
+    centers = np.asarray([piece.get("center", [0, 0]) for piece in pieces], dtype=np.float32)
+    rotates = np.asarray([float(piece.get("rotate_deg", 0.0)) for piece in pieces], dtype=np.float32)
+    median_center = np.median(centers, axis=0)
+    median_rotate = float(np.median(rotates))
+    filtered = []
+    for piece, center, rotate in zip(pieces, centers, rotates):
+        center_error = float(np.linalg.norm(center - median_center))
+        rotate_error = abs(normalize_angle_180(float(rotate) - median_rotate))
+        if center_error <= CAPTURE_OUTLIER_CENTER_PX and rotate_error <= CAPTURE_OUTLIER_ROTATE_DEG:
+            filtered.append(piece)
+    return filtered
+
+
+def average_piece_samples(template_name, pieces):
+    center = average_points([piece.get("center", [0, 0]) for piece in pieces])
+    target_center = average_points([piece.get("target_center", center) for piece in pieces])
+    final_center = average_points([piece.get("final_center", target_center) for piece in pieces])
+    rotate_deg = average_angles([float(piece.get("rotate_deg", 0.0)) for piece in pieces])
+    polygon = average_polygon_field(pieces, "polygon")
+    expanded_polygon = average_polygon_field(pieces, "expanded_polygon") or polygon
+    target_detected_polygon = average_polygon_field(pieces, "target_detected_polygon")
+    final_detected_polygon = average_polygon_field(pieces, "final_detected_polygon") or target_detected_polygon
+
+    averaged = {
+        "id": 0,
+        "area": int(round(float(np.mean([piece.get("area", 0) for piece in pieces])))),
+        "source_area": int(round(float(np.mean([piece.get("source_area", 0) for piece in pieces])))),
+        "center": center,
+        "bbox": bbox_from_polygon(polygon),
+        "side": "left" if center[0] < WARP_W // 2 else "right",
+        "points": len(polygon),
+        "polygon": polygon,
+        "expanded_polygon": expanded_polygon,
+        "template": template_name,
+        "target_side": pieces[0].get("target_side", "?"),
+        "target_polygon": average_polygon_field(pieces, "target_polygon") or target_detected_polygon or polygon,
+        "target_center": target_center,
+        "target_detected_polygon": target_detected_polygon,
+        "final_polygon": average_polygon_field(pieces, "final_polygon") or final_detected_polygon or polygon,
+        "final_center": final_center,
+        "final_detected_polygon": final_detected_polygon,
+        "rotate_deg": round(rotate_deg, 1),
+        "rotate_method": "avg",
+        "move": {
+            "pick": center,
+            "place": target_center,
+            "final_place": final_center,
+            "rotate_deg": round(rotate_deg, 1),
+            "rotate_method": "avg",
+        },
+    }
+    return averaged
+
+
+def average_points(points):
+    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    mean = np.mean(points_array, axis=0)
+    return [int(round(float(mean[0]))), int(round(float(mean[1])))]
+
+
+def average_polygon_field(pieces, field_name):
+    polygons = [piece.get(field_name) for piece in pieces if piece.get(field_name)]
+    if not polygons:
+        return None
+    point_count = len(polygons[0])
+    if any(len(polygon) != point_count for polygon in polygons):
+        return polygons[0]
+    points = np.asarray(polygons, dtype=np.float32)
+    mean = np.mean(points, axis=0)
+    return np.rint(mean).astype(np.int32).tolist()
+
+
+def average_angles(angles):
+    radians = np.radians(np.asarray(angles, dtype=np.float32))
+    sine = float(np.mean(np.sin(radians)))
+    cosine = float(np.mean(np.cos(radians)))
+    if abs(sine) <= 1e-6 and abs(cosine) <= 1e-6:
+        return float(np.mean(angles))
+    return normalize_angle_180(math.degrees(math.atan2(sine, cosine)))
+
+
+def bbox_from_polygon(polygon):
+    if not polygon:
+        return [0, 0, 0, 0]
+    x, y, w, h = cv2.boundingRect(np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2))
+    return [int(x), int(y), int(w), int(h)]
 
 
 def mech_calibration_matrix():
@@ -956,12 +1542,18 @@ def mech_calibration_matrix():
 
 def warp_to_mech_point(point):
     if not MECH_COORD_OUTPUT_ENABLED:
-        return [float(point[0]), float(point[1])]
+        return format_output_mech_point([float(point[0]), float(point[1])])
 
     matrix = mech_calibration_matrix()
     src = np.float32([[[float(point[0]), float(point[1])]]])
     dst = cv2.perspectiveTransform(src, matrix)[0][0]
-    return [float(dst[0]), float(dst[1])]
+    return format_output_mech_point([float(dst[0]), float(dst[1])])
+
+
+def format_output_mech_point(point):
+    if MECH_SWAP_XY_FOR_STM32:
+        return [float(point[1]), float(point[0])]
+    return [float(point[0]), float(point[1])]
 
 
 def format_mech_value(value):
@@ -1010,6 +1602,7 @@ def move_plan_records(result):
                 "place_y": int(round(float(place_y))),
                 "rotate_deg": rotate_deg,
                 "rotate_x10": int(round(rotate_deg * MECH_ROTATE_SCALE)),
+                "rotate_method": move.get("rotate_method", "?"),
             }
         )
     return records
@@ -1063,6 +1656,55 @@ def build_move_packet_binary(result):
     return bytes(packet)
 
 
+def format_gcode_value(value):
+    number = float(value)
+    if abs(number - round(number)) < 1e-6:
+        return str(int(round(number)))
+    return ("%.3f" % number).rstrip("0").rstrip(".")
+
+
+def build_move_packet_gcode(result):
+    records = move_plan_records(result)
+    if not records:
+        return None
+
+    lines = [
+        "G21",
+        "G90",
+    ]
+    for record in records:
+        lines.append("; piece %s rot=%.1f/%s" % (record["name"], record["rotate_deg"], record["rotate_method"]))
+        lines.append("G1 Z%s F%s" % (format_gcode_value(GCODE_PEN_UP_Z), format_gcode_value(GCODE_FEEDRATE)))
+        lines.append(
+            "G0 X%s Y%s F%s"
+            % (
+                format_gcode_value(record["pick_x"]),
+                format_gcode_value(record["pick_y"]),
+                format_gcode_value(GCODE_TRAVEL_FEEDRATE),
+            )
+        )
+        lines.append("G1 Z%s F%s" % (format_gcode_value(GCODE_PEN_DOWN_Z), format_gcode_value(GCODE_FEEDRATE)))
+        if GCODE_ROTATE_AXIS:
+            lines.append(
+                "G1 %s%s F%s"
+                % (
+                    GCODE_ROTATE_AXIS,
+                    format_gcode_value(record["rotate_deg"]),
+                    format_gcode_value(GCODE_FEEDRATE),
+                )
+            )
+        lines.append(
+            "G1 X%s Y%s F%s"
+            % (
+                format_gcode_value(record["place_x"]),
+                format_gcode_value(record["place_y"]),
+                format_gcode_value(GCODE_FEEDRATE),
+            )
+        )
+        lines.append("G1 Z%s F%s" % (format_gcode_value(GCODE_PEN_UP_Z), format_gcode_value(GCODE_FEEDRATE)))
+    return "\n".join(lines)
+
+
 def build_move_packet_log(result):
     records = move_plan_records(result)
     if not records:
@@ -1071,7 +1713,7 @@ def build_move_packet_log(result):
     parts = ["MOVES %d" % len(records)]
     for record in records:
         parts.append(
-            "%s pick=(%d,%d) place=(%d,%d) rot=%.1f"
+            "%s pick=(%d,%d) place=(%d,%d) rot=%.1f/%s"
             % (
                 record["name"],
                 record["pick_x"],
@@ -1079,6 +1721,7 @@ def build_move_packet_log(result):
                 record["place_x"],
                 record["place_y"],
                 record["rotate_deg"],
+                record["rotate_method"],
             )
         )
     return " | ".join(parts)
@@ -1111,15 +1754,30 @@ def send_binary(serial_obj, packet, log_line=None):
 
 
 def send_move_packet(result, serial_obj):
-    if SERIAL_BINARY_PACKET:
+    if SERIAL_OUTPUT_FORMAT == "binary":
         packet = build_move_packet_binary(result)
         if packet:
             send_binary(serial_obj, packet, build_move_packet_log(result))
         return
 
-    packet = build_move_packet_text(result)
+    if SERIAL_OUTPUT_FORMAT == "gcode":
+        packet = build_move_packet_gcode(result)
+    else:
+        packet = build_move_packet_text(result)
     if packet:
         send_text(serial_obj, packet)
+
+
+def print_move_packet(result):
+    if SERIAL_OUTPUT_FORMAT == "binary":
+        log_line = build_move_packet_log(result)
+    elif SERIAL_OUTPUT_FORMAT == "gcode":
+        log_line = build_move_packet_log(result)
+    else:
+        log_line = build_move_packet_text(result)
+
+    if log_line:
+        print(log_line)
 
 
 def get_template_shape_score(piece, template_index):
@@ -1133,6 +1791,13 @@ def first_question_template_area_ratios():
     areas = [polygon_area_cm(template["polygon_cm"]) for template in FIRST_Q_TEMPLATES]
     total = max(1e-6, sum(areas))
     return [area / total for area in areas]
+
+
+def cached_first_question_template_area_ratios():
+    global first_question_area_ratios_cache
+    if first_question_area_ratios_cache is None:
+        first_question_area_ratios_cache = first_question_template_area_ratios()
+    return first_question_area_ratios_cache
 
 
 def polygon_area_cm(points_cm):
@@ -1158,6 +1823,26 @@ def template_contour_for_match(points_cm):
     scale = max(1.0, float(np.max(np.linalg.norm(points, axis=1))))
     points = points / scale * 100.0
     return np.rint(points).astype(np.int32).reshape(-1, 1, 2)
+
+
+def cached_template_contour_for_match(template_index):
+    cached = first_question_template_contour_cache.get(template_index)
+    if cached is None:
+        cached = template_contour_for_match(FIRST_Q_TEMPLATES[template_index]["polygon_cm"])
+        first_question_template_contour_cache[template_index] = cached
+    return cached
+
+
+def cached_rotation_target_sample(target_points):
+    key = (
+        ROTATION_MATCH_SAMPLE_COUNT,
+        tuple((int(point[0]), int(point[1])) for point in target_points),
+    )
+    cached = rotation_target_sample_cache.get(key)
+    if cached is None:
+        cached = resample_closed_polygon(np.asarray(target_points, dtype=np.float32), ROTATION_MATCH_SAMPLE_COUNT)
+        rotation_target_sample_cache[key] = cached
+    return cached
 
 
 def estimate_background_lab(lab, detect_mask):
@@ -1212,14 +1897,15 @@ def simplify_piece_polygon(contour, perimeter):
         approx = cv2.approxPolyDP(contour, epsilon_ratio * perimeter, True)
         if len(approx) >= 3:
             approx = merge_short_polygon_edges(approx, perimeter)
-            if FIRST_QUESTION_MODE and PIECE_REFINE_CORNERS_BY_LINES and 3 <= len(approx) <= PIECE_MAX_POINTS:
-                refined = refine_polygon_corners_by_lines(contour, approx)
-                if refined is not None:
-                    approx = refined
             best = approx
             if 3 <= len(approx) <= PIECE_MAX_POINTS:
-                return approx
+                break
         epsilon_ratio += PIECE_APPROX_EPSILON_STEP
+
+    if FIRST_QUESTION_MODE and PIECE_REFINE_CORNERS_BY_LINES and best is not None and 3 <= len(best) <= PIECE_MAX_POINTS:
+        refined = refine_polygon_corners_by_lines(contour, best)
+        if refined is not None:
+            best = refined
     return best
 
 
@@ -1399,6 +2085,8 @@ def draw_pieces(frame, pieces, piece_contours):
 def draw_first_question_targets(frame, pieces):
     if not FIRST_QUESTION_MODE:
         return
+    if not pieces:
+        return
 
     target_side = None
     for piece in pieces or []:
@@ -1407,20 +2095,24 @@ def draw_first_question_targets(frame, pieces):
             break
     if target_side is None:
         target_side = choose_first_question_target_side(pieces or [])
-    layout = first_question_target_layout(target_side, use_place_margin=True)
-    for name, target in layout.items():
-        polygon = np.asarray(target["polygon"], dtype=np.int32).reshape(-1, 1, 2)
-        cv2.drawContours(frame, [polygon], -1, CYAN, 1)
-        tx, ty = target["center"]
-        cv2.putText(frame, name, (tx + 4, max(12, ty - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
+    layout = cached_first_question_target_layout(target_side, use_place_margin=False)
+    layout_points = []
+    for target in layout.values():
+        layout_points.extend(target["polygon"])
+    if layout_points:
+        x, y, w, h = cv2.boundingRect(np.asarray(layout_points, dtype=np.int32).reshape(-1, 1, 2))
+        cv2.rectangle(frame, (x, y), (x + w, y + h), CYAN, 1)
 
     for piece in pieces or []:
         if "target_center" not in piece:
             continue
-        cx, cy = piece.get("center", [0, 0])
+        if piece.get("target_detected_polygon"):
+            detected_polygon = np.asarray(piece["target_detected_polygon"], dtype=np.int32).reshape(-1, 1, 2)
+            cv2.drawContours(frame, [detected_polygon], -1, CYAN, 2)
         tx, ty = piece["target_center"]
-        cv2.line(frame, (int(cx), int(cy)), (int(tx), int(ty)), CYAN, 1)
         cv2.circle(frame, (int(tx), int(ty)), 3, CYAN, -1)
+        if piece.get("template"):
+            cv2.putText(frame, piece["template"], (int(tx) + 4, max(12, int(ty) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
 
 
 def draw_piece_debug_info(frame, result, fps, piece_debug):
@@ -1432,6 +2124,11 @@ def draw_piece_debug_info(frame, result, fps, piece_debug):
             PIECE_GREEN_H_HIGH,
             int(PIECE_HSV_DIFF_THRESHOLD),
         )
+    elif PIECE_MASK_METHOD == "black":
+        bg_color = piece_debug.get("bg_color")
+        threshold = int(bg_color[0]) if bg_color is not None else int(PIECE_BLACK_V_MIN_THRESHOLD)
+        bg_v = int(bg_color[1]) if bg_color is not None else 0
+        mask_info = "mode:%d BLACK V>%d bg:%d" % (DISPLAY_MODE, threshold, bg_v)
     else:
         mask_info = "mode:%d LAB thr:%d" % (DISPLAY_MODE, int(PIECE_BG_DIFF_THRESHOLD))
     draw_text_bg(frame, 8, 46, mask_info, WHITE, 0.5)
@@ -1468,6 +2165,14 @@ def draw_piece_debug_info(frame, result, fps, piece_debug):
             PIECE_HSV_DIFF_BLUR_KERNEL[1],
             PIECE_MASK_MEDIAN_KERNEL,
         )
+    elif PIECE_MASK_METHOD == "black":
+        detail = "min:%d off:%d blur:%dx%d med:%d" % (
+            PIECE_BLACK_V_MIN_THRESHOLD,
+            PIECE_BLACK_V_OFFSET,
+            PIECE_BLACK_BLUR_KERNEL[0],
+            PIECE_BLACK_BLUR_KERNEL[1],
+            PIECE_MASK_MEDIAN_KERNEL,
+        )
     else:
         detail = "lw:%.2f" % PIECE_L_DIFF_WEIGHT
     draw_text_bg(frame, 8, 106, "cnt_mask:%s %s" % (piece_debug.get("contour_mask", "?"), detail), WHITE, 0.5)
@@ -1485,6 +2190,8 @@ def distance_map_to_view(distance_map):
     if PIECE_MASK_METHOD == "hsv":
         max_value = max(1.0, float(np.percentile(distance_map, 98)))
         view_gray = np.clip(distance_map * (255.0 / max_value), 0, 255).astype(np.uint8)
+    elif PIECE_MASK_METHOD == "black":
+        view_gray = np.clip(distance_map, 0, 255).astype(np.uint8)
     else:
         view_gray = np.clip(distance_map * (255.0 / max(1.0, PIECE_BG_DIFF_THRESHOLD * 2.0)), 0, 255).astype(np.uint8)
     return cv2.cvtColor(view_gray, cv2.COLOR_GRAY2BGR)
@@ -1561,9 +2268,29 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
     return view
 
 
+def display_requires_a4_warp(result):
+    if not result.get("status"):
+        return False
+    if DISPLAY_MODE == 1:
+        return True
+    return DISPLAY_MODE in (5, 6) and not DEBUG_SHOW_ORIGINAL_PROCESS
+
+
 def on_key(key_id, state):
     if ENABLE_KEY_EXIT and state == key.State.KEY_LONG_PRESSED:
         app.set_exit_flag(True)
+        return
+
+    if SEND_SERIAL_ON_KEY_PRESS and is_key_send_state(state):
+        global capture_requested
+        capture_requested = True
+
+
+def is_key_send_state(state):
+    for state_name in ("KEY_PRESSED", "KEY_SHORT_PRESSED"):
+        if hasattr(key.State, state_name) and state == getattr(key.State, state_name):
+            return True
+    return False
 
 
 def create_camera():
@@ -1585,6 +2312,8 @@ def create_serial():
 
 
 def main():
+    global capture_requested
+
     cam = create_camera()
     try:
         cam.skip_frames(30)
@@ -1600,43 +2329,160 @@ def main():
     last_fps_ms = last_print_ms
     frame_count = 0
     fps = 0
+    perf_accum = {
+        "image2cv": 0,
+        "a4": 0,
+        "matrix": 0,
+        "pieces": 0,
+        "display": 0,
+        "total": 0,
+    }
+    capture_remaining = 0
+    capture_samples = []
+    held_result = None
+    held_piece_contours = []
+    held_matrix = None
+    held_until_ms = 0
+    capture_wait_logged = False
 
     while not app.need_exit():
+        loop_start_ms = time.ticks_ms()
         maix_img = cam.read()
+        image2cv_start_ms = time.ticks_ms()
         frame = image.image2cv(maix_img, ensure_bgr=True, copy=True)
+        image2cv_end_ms = time.ticks_ms()
 
+        a4_start_ms = time.ticks_ms()
         raw_result = detector.detect(frame)
+        a4_end_ms = time.ticks_ms()
         result = stabilizer.update(raw_result)
         a4_warp = None
+        matrix = None
         pieces = []
         piece_contours = []
         piece_debug = make_empty_piece_debug()
+        output_result = result
         if result.get("status"):
-            a4_warp, matrix, _ = warp_a4(frame, result["corners"])
-            pieces, piece_contours, piece_debug = detect_pieces(frame, result["corners"], matrix)
-            result = result.copy()
-            result["pieces_count"] = len(pieces)
-            result["pieces"] = pieces
-            if FIRST_QUESTION_MODE:
-                result["move_plan"] = build_move_plan(pieces)
+            matrix_start_ms = time.ticks_ms()
+            matrix, _ = a4_perspective_matrices(result["corners"])
+            matrix_end_ms = time.ticks_ms()
+            pieces_start_ms = time.ticks_ms()
+            now_for_capture = time.ticks_ms()
+            if capture_requested:
+                capture_requested = False
+                capture_remaining = CAPTURE_FRAME_COUNT
+                capture_samples = []
+                capture_wait_logged = False
+                print("CAPTURE START frames=%d" % CAPTURE_FRAME_COUNT)
+
+            if capture_remaining > 0:
+                pieces, piece_contours, piece_debug = detect_pieces(frame, result["corners"], matrix)
+                capture_result = result.copy()
+                capture_result["pieces_count"] = len(pieces)
+                capture_result["pieces"] = pieces
+                if FIRST_QUESTION_MODE:
+                    capture_result["move_plan"] = build_move_plan(pieces)
+                capture_samples.append(capture_result)
+                capture_remaining -= 1
+                output_result = capture_result
+                if capture_remaining <= 0:
+                    aggregated_result, aggregated_contours = aggregate_capture_samples(capture_samples)
+                    if aggregated_result is not None:
+                        held_result = aggregated_result
+                        held_piece_contours = aggregated_contours
+                        held_matrix, _ = a4_perspective_matrices(held_result["corners"])
+                        held_until_ms = now_for_capture + CAPTURE_HOLD_MS
+                        output_result = held_result
+                        pieces = held_result.get("pieces", [])
+                        piece_contours = held_piece_contours
+                        print("CAPTURE OK valid=%d pieces=%d" % (held_result.get("capture_frames", 0), len(pieces)))
+                        send_move_packet(held_result, serial_obj)
+                    else:
+                        held_result = None
+                        held_piece_contours = []
+                        held_matrix = None
+                        held_until_ms = 0
+                        print("CAPTURE FAIL valid=%d" % len(capture_samples))
+            elif held_result is not None and now_for_capture <= held_until_ms:
+                output_result = held_result
+                pieces = held_result.get("pieces", [])
+                piece_contours = held_piece_contours
+            elif held_result is not None and now_for_capture > held_until_ms:
+                held_result = None
+                held_piece_contours = []
+                held_matrix = None
+                held_until_ms = 0
+            pieces_end_ms = time.ticks_ms()
+        else:
+            now_for_capture = time.ticks_ms()
+            if capture_requested and not capture_wait_logged:
+                print("CAPTURE WAIT A4")
+                capture_wait_logged = True
+            if held_result is not None and now_for_capture <= held_until_ms:
+                output_result = held_result
+                pieces = held_result.get("pieces", [])
+                piece_contours = held_piece_contours
+            elif held_result is not None and now_for_capture > held_until_ms:
+                held_result = None
+                held_piece_contours = []
+                held_matrix = None
+                held_until_ms = 0
+            matrix_start_ms = matrix_end_ms = time.ticks_ms()
+            pieces_start_ms = pieces_end_ms = matrix_end_ms
+
+        frame_count += 1
+        display_start_ms = time.ticks_ms()
+        display_result = result
+        display_matrix = matrix
+        if output_result is held_result and held_matrix is not None:
+            display_result = held_result
+            display_matrix = held_matrix
+        elif output_result is not result and result.get("status"):
+            display_result = result.copy()
+            display_result["pieces_count"] = output_result.get("pieces_count", 0)
+            display_result["pieces"] = output_result.get("pieces", [])
+            display_result["move_plan"] = output_result.get("move_plan", [])
+        if display_matrix is not None and display_requires_a4_warp(display_result):
+            a4_warp = cv2.warpPerspective(frame, display_matrix, (WARP_W, WARP_H))
+        view = make_display_view(frame, display_result, fps, a4_warp, pieces, piece_contours, piece_debug)
+        disp.show(image.cv2image(view, bgr=True, copy=True))
+        display_end_ms = time.ticks_ms()
+
+        if PERF_PROFILE:
+            perf_accum["image2cv"] += image2cv_end_ms - image2cv_start_ms
+            perf_accum["a4"] += a4_end_ms - a4_start_ms
+            perf_accum["matrix"] += matrix_end_ms - matrix_start_ms
+            perf_accum["pieces"] += pieces_end_ms - pieces_start_ms
+            perf_accum["display"] += display_end_ms - display_start_ms
+            perf_accum["total"] += display_end_ms - loop_start_ms
 
         now = time.ticks_ms()
-        frame_count += 1
         if now - last_fps_ms >= 1000:
             fps = frame_count
+            if PERF_PROFILE and frame_count > 0:
+                print(
+                    "PERF n=%d image2cv=%.1f a4=%.1f matrix=%.1f pieces=%.1f display=%.1f total=%.1f ms"
+                    % (
+                        frame_count,
+                        perf_accum["image2cv"] / frame_count,
+                        perf_accum["a4"] / frame_count,
+                        perf_accum["matrix"] / frame_count,
+                        perf_accum["pieces"] / frame_count,
+                        perf_accum["display"] / frame_count,
+                        perf_accum["total"] / frame_count,
+                    )
+                )
+                for key_name in perf_accum:
+                    perf_accum[key_name] = 0
             frame_count = 0
             last_fps_ms = now
 
-        view = make_display_view(frame, result, fps, a4_warp, pieces, piece_contours, piece_debug)
-
         if now - last_print_ms >= PRINT_INTERVAL_MS:
             if PRINT_MOVE_ONLY:
-                send_move_packet(result, serial_obj)
+                print_move_packet(output_result)
             else:
-                print(result)
+                print(output_result)
             last_print_ms = now
-
-        disp.show(image.cv2image(view, bgr=True, copy=True))
 
     if key_obj:
         del key_obj
