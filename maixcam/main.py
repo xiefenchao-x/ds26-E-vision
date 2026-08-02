@@ -8,101 +8,132 @@ import numpy as np
 import math
 import itertools
 import struct
+import heapq
 
 
 # =========================
 # Config: MaixCAM2 OpenCV A4
 # =========================
+# 主配置区：负责摄像头采集、A4 纸透视矫正、碎片识别、第一/第二问拼接求解、
+# 以及最后输出给 STM32/机械端的坐标。调参数时优先看这一段。
 
+# 摄像头输入分辨率，单位像素；分辨率越高识别越细，但 MaixCAM 处理会更慢。
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+
+# A4 纸透视矫正后的标准画布尺寸，单位像素。
+# 程序检测到 A4 四角后，会把纸面拉正到 WARP_W x WARP_H，后续碎片坐标都基于这个坐标系。
 WARP_W = 594
 WARP_H = 420
+
+# A4 纸真实尺寸。cm 用于题目尺寸换算，mm 用于机械坐标和串口输出。
 A4_W_CM = 29.7
 A4_H_CM = 21.0
 A4_W_MM = A4_W_CM * 10.0
 A4_H_MM = A4_H_CM * 10.0
 
-GAUSSIAN_KERNEL = (5, 5)
-CANNY_LOW = 50
-CANNY_HIGH = 150
-MORPH_CLOSE_KERNEL = (5, 5)
-MORPH_CLOSE_ITERATIONS = 1
+# A4 外框边缘检测预处理参数。
+GAUSSIAN_KERNEL = (5, 5)       # 高斯模糊核，先降噪，避免 Canny 检出太多杂边。
+CANNY_LOW = 50                 # Canny 低阈值，影响弱边缘保留程度。
+CANNY_HIGH = 150               # Canny 高阈值，影响强边缘判定。
+MORPH_CLOSE_KERNEL = (5, 5)    # 闭运算核，用来连接断开的 A4 外框边缘。
+MORPH_CLOSE_ITERATIONS = 1     # 闭运算次数，过大会让相邻轮廓粘在一起。
 
-APPROX_EPSILON_RATIO = 0.025
-MIN_AREA_RATIO = 0.07
-MAX_AREA_RATIO = 0.65
+# A4 候选轮廓筛选参数。
+APPROX_EPSILON_RATIO = 0.025   # 多边形拟合精度比例，用于把 A4 轮廓近似成四边形。
+MIN_AREA_RATIO = 0.07          # A4 候选最小面积占整帧比例，过滤小噪声。
+MAX_AREA_RATIO = 0.65          # A4 候选最大面积占整帧比例，过滤异常大区域。
 
 # 防止把中间黑线分出的半张纸当成 A4。
 # 如果同一帧里存在更大的 A4 外轮廓，即使它没有拟合成四边形，小候选也会被过滤。
 CANDIDATE_MIN_RELATIVE_AREA = 0.65
 
+# A4 外框允许连续丢失的帧数；短暂遮挡/抖动时不立刻清空检测状态。
 MAX_LOST_FRAMES = 5
 
-PIECE_DETECTION_ENABLED = True
-QUESTION_MODE = 2
+# 题目模式和碎片识别总开关。
+PIECE_DETECTION_ENABLED = True     # 是否启用碎片检测；False 时只检测/显示 A4 外框。
+QUESTION_MODE = 2                  # 当前题号：1 使用第一问模板匹配，2 使用第二问通用拼接。
 FIRST_QUESTION_MODE = QUESTION_MODE == 1
 SECOND_QUESTION_MODE = QUESTION_MODE == 2
-PIECE_MASK_METHOD = "black"
-PIECE_PROCESS_A4_ROI = True
-PIECE_BG_BORDER_SAMPLE = 24
-PIECE_BG_DIFF_THRESHOLD = 35.0
-PIECE_L_DIFF_WEIGHT = 0.25
-PIECE_A_DIFF_WEIGHT = 1.0
-PIECE_B_DIFF_WEIGHT = 1.0
-PIECE_GREEN_H_LOW = 51
-PIECE_GREEN_H_HIGH = 91
-PIECE_GREEN_S_LOW = 52
-PIECE_GREEN_S_HIGH = 255
-PIECE_GREEN_V_LOW = 75
-PIECE_GREEN_V_HIGH = 255
-PIECE_HSV_DIFF_THRESHOLD = 35.0
-PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)
-# Black A4 mode: keep this low enough to preserve shaded/low-reflectance corners.
-PIECE_BLACK_V_MIN_THRESHOLD = 90
-PIECE_BLACK_V_OFFSET = 55
-PIECE_BLACK_BLUR_KERNEL = (3, 3)
-PIECE_MASK_MEDIAN_KERNEL = 3
-PIECE_MASK_OPEN_KERNEL = (3, 3)
-PIECE_MASK_CLOSE_KERNEL = (3, 3)
-# OPEN 会直接削掉凸出的尖角。背景差分已经比较干净，默认关闭，只保留一次小核 CLOSE 补断口。
+PIECE_MASK_METHOD = "black"        # 碎片分割方式；black 表示按黑色背景和亮度/颜色差分提取碎片。
+PIECE_PROCESS_A4_ROI = True        # 是否只在透视后的 A4 区域内处理碎片，减少画面外干扰。
+
+# 背景采样和 Lab 色差参数。
+PIECE_BG_BORDER_SAMPLE = 24        # 从 A4 边缘向内采样背景的宽度，单位像素。
+PIECE_BG_DIFF_THRESHOLD = 35.0     # 与背景色差超过该阈值才认为可能是碎片。
+PIECE_L_DIFF_WEIGHT = 0.25         # Lab 亮度 L 通道权重，较低可减小阴影/光照影响。
+PIECE_A_DIFF_WEIGHT = 1.0          # Lab a 通道权重，主要描述红绿方向差异。
+PIECE_B_DIFF_WEIGHT = 1.0          # Lab b 通道权重，主要描述黄蓝方向差异。
+
+# HSV 绿色范围；用于绿色碎片/纸面时的辅助分割。
+PIECE_GREEN_H_LOW = 51             # H 色相下限。
+PIECE_GREEN_H_HIGH = 91            # H 色相上限。
+PIECE_GREEN_S_LOW = 52             # S 饱和度下限，太低说明颜色偏灰。
+PIECE_GREEN_S_HIGH = 255           # S 饱和度上限。
+PIECE_GREEN_V_LOW = 75             # V 亮度下限。
+PIECE_GREEN_V_HIGH = 255           # V 亮度上限。
+PIECE_HSV_DIFF_THRESHOLD = 35.0    # HSV 差分阈值，用于辅助判断目标和背景差异。
+PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)# HSV 差分图模糊核，减少小噪点。
+
+# 黑色背景分割参数；现场黑底时，用 V 通道亮度把碎片从背景中提出来。
+# 这里的阈值比第一问参考文件更低，是为了保留阴影区或反光较弱的碎片角点。
+PIECE_BLACK_V_MIN_THRESHOLD = 90   # V 通道绝对亮度阈值，亮于它才可能是碎片。
+PIECE_BLACK_V_OFFSET = 55          # 相对背景亮度偏移，用于适应不同灯光环境。
+PIECE_BLACK_BLUR_KERNEL = (3, 3)   # 黑底分割前的模糊核。
+
+# 碎片 mask 清理参数。
+PIECE_MASK_MEDIAN_KERNEL = 3       # 中值滤波核，去除椒盐噪声。
+PIECE_MASK_OPEN_KERNEL = (3, 3)    # 开运算核，用于去小白点。
+PIECE_MASK_CLOSE_KERNEL = (3, 3)   # 闭运算核，用于补小断口。
+# OPEN 会直接削掉凸出的尖角。背景差分已经比较干净，默认关闭，只保留小核 CLOSE 补断口。
 PIECE_MASK_OPEN_ITERATIONS = 0
 PIECE_MASK_CLOSE_ITERATIONS = 0
-PIECE_USE_CLEAN_MASK_FOR_CONTOURS = False
+PIECE_USE_CLEAN_MASK_FOR_CONTOURS = False # 是否用清理后的 mask 找轮廓；False 可保留更多原始边缘细节。
+
+# 粘连碎片拆分参数；碎片贴在一起时可开启，但可能误拆单块。
 PIECE_SPLIT_TOUCHING_ENABLED = False
-PIECE_SPLIT_ERODE_KERNEL = (3, 3)
-PIECE_SPLIT_ERODE_ITERATIONS = 3
-PIECE_USE_CONVEX_HULL = True
-PIECE_APPROX_EPSILON_RATIO = 0.008
-PIECE_APPROX_EPSILON_STEP = 0.003
-PIECE_APPROX_EPSILON_MAX = 0.035
-PIECE_MIN_EDGE_LENGTH_RATIO = 0.025
-PIECE_REFINE_CORNERS_BY_LINES = True
-PIECE_LINE_FIT_TRIM_RATIO = 0.18
-PIECE_MAX_POINTS = 5
-PIECE_MAX_COUNT = 4
-PIECE_MIN_AREA_RATIO = 0.002
-PIECE_MAX_AREA_RATIO = 0.30
-PIECE_BORDER_MARGIN = 8
-PIECE_FRAME_MASK_MARGIN = 6
-PIECE_MIN_BBOX_SIDE = 8
-PIECE_MAX_ASPECT_RATIO = 8.0
-PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.30
+PIECE_SPLIT_ERODE_KERNEL = (3, 3)      # 腐蚀核大小，用于把粘连区域分开。
+PIECE_SPLIT_ERODE_ITERATIONS = 3       # 腐蚀次数，越大拆分越强，也越容易破坏形状。
 
-FIRST_Q_RECT_W_CM = 10.0
-FIRST_Q_RECT_H_CM = 6.0
-FIRST_Q_TARGET_SIDE = "auto"
-FIRST_Q_TARGET_ORIENTATION = "portrait"
-FIRST_Q_PLACE_MARGIN_CM = 0.0
-FIRST_Q_DIAG_A = [2.0, 0.0]
-FIRST_Q_DIAG_P = [3.6, 1.2]
-FIRST_Q_DIAG_Q = [7.6, 4.2]
-FIRST_Q_MATCH_SHAPE_WEIGHT = 1.0
-FIRST_Q_MATCH_AREA_WEIGHT = 4.0
-FIRST_Q_MATCH_POINT_WEIGHT = 0.08
-ROTATION_MATCH_SAMPLE_COUNT = 32
-ROTATION_MATCH_MAX_CANDIDATES = 12
+# 碎片轮廓拟合与过滤参数。
+PIECE_USE_CONVEX_HULL = True           # 是否先取凸包，减少轮廓凹坑/毛刺影响。
+PIECE_APPROX_EPSILON_RATIO = 0.008     # 多边形拟合初始精度比例，越小保留顶点越多。
+PIECE_APPROX_EPSILON_STEP = 0.003      # 拟合失败时逐步放宽的步长。
+PIECE_APPROX_EPSILON_MAX = 0.035       # 最大拟合精度比例，防止过度简化。
+PIECE_MIN_EDGE_LENGTH_RATIO = 0.025    # 最短边相对 A4 尺寸的比例，过滤毛刺短边。
+PIECE_REFINE_CORNERS_BY_LINES = True   # 是否用直线拟合交点细化角点位置。
+PIECE_LINE_FIT_TRIM_RATIO = 0.18       # 拟合边线时裁掉两端比例，减少角点附近噪声干扰。
+PIECE_MAX_POINTS = 5                   # 单个碎片最多角点数；题目碎片一般是 3~5 点。
+PIECE_MAX_COUNT = 4                    # 最多识别/求解 4 块碎片。
+PIECE_MIN_AREA_RATIO = 0.002           # 碎片最小面积占 A4 区域比例，过滤小噪声。
+PIECE_MAX_AREA_RATIO = 0.30            # 碎片最大面积占 A4 区域比例，过滤误检大块。
+PIECE_BORDER_MARGIN = 8                # 过滤贴近整帧边框的干扰轮廓，单位像素。
+PIECE_ALLOW_A4_EDGE_TOUCH = True        # 允许碎片贴 A4 边缘；否则角在纸边时容易被误过滤/削掉。
+PIECE_A4_MASK_INNER_SCALE = 1.0         # A4 mask 内缩比例；1.0 表示不内缩，避免贴边碎片被裁角。
+PIECE_FRAME_MASK_MARGIN = 0            # A4 mask 腐蚀边距；第二问贴边时设 0，避免削掉边缘角。
+PIECE_MIN_BBOX_SIDE = 8                # 外接框最小边长，过滤极小轮廓。
+PIECE_MAX_ASPECT_RATIO = 8.0           # 外接框最大长宽比，过滤细长线状噪声。
+PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.20 # 拼好后的目标显示/匹配放大倍数。
 
+# 第一问目标矩形和模板参数，单位厘米。
+FIRST_Q_RECT_W_CM = 10.0               # 第一问目标矩形宽度。
+FIRST_Q_RECT_H_CM = 6.0                # 第一问目标矩形高度。
+FIRST_Q_TARGET_SIDE = "auto"           # 目标区域放置侧；auto 表示程序自动选择。
+FIRST_Q_TARGET_ORIENTATION = "portrait"# 目标布局方向；portrait 表示竖向显示/输出。
+FIRST_Q_PLACE_MARGIN_CM = 0.0          # 目标放置外边距，单位厘米。
+
+# 第一问官方切割模板关键点，坐标原点是 10 cm x 6 cm 矩形左上角。
+FIRST_Q_DIAG_A = [2.0, 0.0]            # 模板中的 A 点，位于上边。
+FIRST_Q_DIAG_P = [3.6, 1.2]            # 模板中的内部连接点 P。
+FIRST_Q_DIAG_Q = [7.6, 4.2]            # 模板中的内部连接点 Q。
+FIRST_Q_MATCH_SHAPE_WEIGHT = 1.0       # 模板匹配中形状相似度权重。
+FIRST_Q_MATCH_AREA_WEIGHT = 4.0        # 模板匹配中面积比例权重。
+FIRST_Q_MATCH_POINT_WEIGHT = 0.08      # 模板匹配中角点距离权重。
+ROTATION_MATCH_SAMPLE_COUNT = 32       # 旋转匹配时采样多少个角度。
+ROTATION_MATCH_MAX_CANDIDATES = 12     # 每块碎片最多保留多少个旋转候选。
+
+# 第一问四块标准模板，单位厘米；A/B/C/D 是目标矩形被切开后的四块标准形状。
 FIRST_Q_TEMPLATES = [
     {"name": "A", "polygon_cm": [[0.0, 0.0], FIRST_Q_DIAG_A, FIRST_Q_DIAG_P, [0.0, 2.0]]},
     {"name": "B", "polygon_cm": [[0.0, 2.0], FIRST_Q_DIAG_P, FIRST_Q_DIAG_Q, [0.0, 3.0]]},
@@ -110,43 +141,63 @@ FIRST_Q_TEMPLATES = [
     {"name": "D", "polygon_cm": [FIRST_Q_DIAG_A, [10.0, 0.0], [10.0, 6.0], FIRST_Q_DIAG_Q, FIRST_Q_DIAG_P]},
 ]
 
-SECOND_Q_RECT_MIN_W_CM = 9.0
-SECOND_Q_RECT_MIN_H_CM = 5.0
-SECOND_Q_RECT_MAX_W_CM = 12.0
-SECOND_Q_RECT_MAX_H_CM = 9.0
-SECOND_Q_TARGET_SIDE = "auto"
-SECOND_Q_CENTERLINE_GAP_CM = 1.0
-SECOND_Q_MATCH_REL_TOLERANCE = 0.12
+# 第二问目标矩形尺寸范围，单位厘米；求解后会尽量拼成满足该尺寸范围的矩形。
+SECOND_Q_RECT_MIN_W_CM = 9.0           # 允许的最小宽度。
+SECOND_Q_RECT_MIN_H_CM = 5.0           # 允许的最小高度。
+SECOND_Q_RECT_MAX_W_CM = 12.0          # 允许的最大宽度。
+SECOND_Q_RECT_MAX_H_CM = 9.0           # 允许的最大高度。
+SECOND_Q_TARGET_SIDE = "auto"          # 第二问目标放置侧；auto 根据当前碎片位置选左/右。
+SECOND_Q_CENTERLINE_GAP_CM = 1.0       # 目标区和 A4 中线之间预留间隙，单位厘米。
+
+# 第二问边匹配候选参数。
+SECOND_Q_MATCH_REL_TOLERANCE = 0.12    # 两条整边长度相差比例小于它才认为可能完整匹配。
 # 窗口放宽以覆盖深 T(如 0.9 占比);惩罚保持平坦,深 T 同样是合法拓扑。
-SECOND_Q_PARTIAL_RATIO_MIN = 0.12
-SECOND_Q_PARTIAL_RATIO_MAX = 0.92
-SECOND_Q_COMPOSITE_EDGE_MAX_SPAN = 3
-SECOND_Q_COMPOSITE_EDGE_MIN_CHORD_RATIO = 0.96
-SECOND_Q_COMPOSITE_EDGE_MAX_DEVIATION_PX = 12.0
-SECOND_Q_SOLVE_PADDING_PX = 10
-SECOND_Q_DIMENSION_TOLERANCE_CM = 0.8
-SECOND_Q_MIN_RECT_FILL_RATIO = 0.45
-SECOND_Q_GOOD_RECT_FILL_RATIO = 0.88
-SECOND_Q_MAX_OVERLAP_RATIO = 0.12
-SECOND_Q_GOOD_OVERLAP_RATIO = 0.02
-SECOND_Q_RECT_APPROX_EPSILON_RATIO = 0.025
-SECOND_Q_FULL_MATCHES_PER_PAIR = 8
+SECOND_Q_PARTIAL_RATIO_MIN = 0.12      # T 形/局部边匹配的最小占比。
+SECOND_Q_PARTIAL_RATIO_MAX = 0.92      # T 形/局部边匹配的最大占比。
+SECOND_Q_COMPOSITE_EDGE_MAX_SPAN = 3   # 允许把连续几条近共线边合成一条复合边。
+SECOND_Q_COMPOSITE_EDGE_MIN_CHORD_RATIO = 0.96 # 复合边弦长/路径长下限，越接近 1 越要求共线。
+SECOND_Q_COMPOSITE_EDGE_MAX_DEVIATION_PX = 12.0# 复合边中间点偏离弦线的最大像素距离。
+
+# 第二问拼接评分和尺寸容差参数。
+SECOND_Q_SOLVE_PADDING_PX = 10         # 光栅化评分时给拼接结果周围留的空白边。
+SECOND_Q_DIMENSION_TOLERANCE_CM = 0.8  # 目标矩形尺寸容差，单位厘米。
+SECOND_Q_MIN_RECT_FILL_RATIO = 0.45    # 最低矩形填充率，太低说明拼得很散。
+SECOND_Q_GOOD_RECT_FILL_RATIO = 0.88   # 较好填充率参考值，用于评分/调试判断。
+SECOND_Q_MAX_OVERLAP_RATIO = 0.12      # 拼接允许的最大重叠比例。
+SECOND_Q_GOOD_OVERLAP_RATIO = 0.02     # 较好重叠比例参考值。
+SECOND_Q_RECT_APPROX_EPSILON_RATIO = 0.025 # 矩形轮廓近似精度比例。
+
+# 第二问组合枚举规模控制；这些参数直接影响速度和内存。
+SECOND_Q_FULL_MATCHES_PER_PAIR = 8     # 每对碎片保留多少个完整边匹配候选。
 # partial 不设过小截断:局部特征无法可靠地区分真假 T 匹配,真值靠评分函数裁决。
-SECOND_Q_PARTIAL_MATCHES_PER_PAIR = 22
+SECOND_Q_PARTIAL_MATCHES_PER_PAIR = 22 # 每对碎片保留多少个局部/T 边匹配候选。
 # 组合惩罚预算剪枝:超过该预算的组合不可能进入最终短名单。
 SECOND_Q_COMBO_PENALTY_BUDGET = 0.75
 # 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时。
-SECOND_Q_MAX_SCORED_COMBOS = 800
-SECOND_Q_MAX_SOLVE_COMBOS = 2500
-SECOND_Q_MAX_MATCHING_COMBO_CHECKS = 20000
-SECOND_Q_SOLVE_TIME_LIMIT_MS = 8000
+SECOND_Q_MAX_SCORED_COMBOS = 800       # 最多进入光栅化评分的组合数。
+SECOND_Q_MAX_SOLVE_COMBOS = 2500       # 预留的最大求解组合数上限。
+SECOND_Q_MAX_MATCHING_COMBO_CHECKS = 20000 # 预留的匹配组合检查上限。
+SECOND_Q_SOLVE_TIME_LIMIT_MS = 8000    # 第二问单次求解软时间限制，单位毫秒。
 # 新拼接算法以光栅化掩膜评分为准(同参考实现);凸包近似评分对凹片/五边形会误判。
 SECOND_Q_USE_FAST_GEOMETRY_SCORE = False
+
+# 第二问切割拓扑和调试开关。
 # Try a known topology first: auto/common/t_junction/corner/concave/equal_rectangles/branched_spine.
 # Use "all_reference" to scan the reference simulator's named modes.
-SECOND_Q_CUT_MODE = "branched_spine"
-SECOND_Q_REFERENCE_MATCHING = True
-SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v16"
+SECOND_Q_CUT_MODE = "branched_spine"   # 当前优先使用的参考拓扑名称，实际求解阶段会走 auto 枚举。
+SECOND_Q_REFERENCE_MATCHING = True     # 是否启用参考拓扑风格的边匹配策略。
+SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v16" # 调试输出中的求解器版本标记。
+# 第二问遇到第一问官方切法时先按官方邻接拓扑跑第二问算法,失败再回全量通用搜索。
+SECOND_Q_FIRST_TEMPLATE_DETECT_ENABLED = True
+SECOND_Q_FIRST_TEMPLATE_TOPOLOGY_FIRST = True
+SECOND_Q_FIRST_TEMPLATE_MAX_COST = 1.60
+SECOND_Q_FIRST_TEMPLATE_MAX_SHAPE_SCORE = 0.36
+SECOND_Q_FIRST_TEMPLATE_AREA_WEIGHT = 0.80       # 打乱摆放时面积/阴影波动较大,这里只弱化面积约束。
+SECOND_Q_FIRST_TEMPLATE_POINT_WEIGHT = 0.04      # 角点数量只作弱参考,避免拟合多/少一个点就漏检。
+SECOND_Q_FIRST_TEMPLATE_CANDIDATES_PER_PAIR = 6   # 第一问拓扑快车道中每对相邻碎片最多保留的接缝候选。
+SECOND_Q_FIRST_TEMPLATE_MAX_SCORED_COMBOS = 80    # 第一问拓扑快车道最多评分的组合数。
+
+# 第二问边界/直角/接触评分参数；当前主评分与参考实现对齐，部分项只保留给调试或备用。
 SECOND_Q_BOUNDARY_EDGE_WEIGHT = 80.0
 SECOND_Q_BOUNDARY_EDGE_MAX_ERROR_PX = 28.0
 SECOND_Q_BOUNDARY_COVER_DISTANCE_PX = 16.0
@@ -160,20 +211,31 @@ SECOND_Q_RIGHT_CORNER_MAX_ERROR_PX = 28.0
 SECOND_Q_RIGHT_CORNER_MIN_COUNT = 3
 SECOND_Q_RECT_FROM_RIGHT_CORNERS = True
 SECOND_Q_RECT_AREA_WEIGHT = 10.0
+
+# 第二问固定 10 cm x 6 cm 目标矩形评分参数。
 SECOND_Q_USE_FIXED_RECT_SCORE = True
 SECOND_Q_FIXED_RECT_W_CM = FIRST_Q_RECT_W_CM
 SECOND_Q_FIXED_RECT_H_CM = FIRST_Q_RECT_H_CM
-SECOND_Q_FIXED_AREA_WEIGHT = 4.0
-SECOND_Q_FIXED_RECT_AREA_WEIGHT = 30.0
-SECOND_Q_FIXED_ASPECT_WEIGHT = 80000.0
-SECOND_Q_FIXED_PERIMETER_WEIGHT = 25.0
-SECOND_Q_BOUNDARY_REPAIR_REL_TOLERANCE = 0.12
-SECOND_Q_BOUNDARY_REPAIR_WEIGHT = 160.0
-SECOND_Q_DEBUG_TOP_N = 5
-SECOND_Q_DEBUG_CANDIDATES = True
-SECOND_Q_DEBUG_MAX_CAND_PRINT = 60
-SECOND_Q_SOLVE_PROGRESS_INTERVAL = 100
-SECOND_Q_DEBUG_SHORT_EDGE_PX = 20.0
+SECOND_Q_FIXED_AREA_WEIGHT = 4.0       # 拼接面积接近固定目标面积的权重。
+SECOND_Q_FIXED_RECT_AREA_WEIGHT = 30.0 # 最小外接矩形面积接近固定目标面积的权重。
+SECOND_Q_FIXED_ASPECT_WEIGHT = 80000.0 # 长宽比偏离 10:6 的惩罚权重。
+SECOND_Q_FIXED_PERIMETER_WEIGHT = 25.0 # 外轮廓周长偏离目标周长的惩罚权重。
+SECOND_Q_BOUNDARY_REPAIR_REL_TOLERANCE = 0.12 # 边界缺口可由某条边修补时的长度容差。
+SECOND_Q_BOUNDARY_REPAIR_WEIGHT = 160.0       # 边界修补项权重，当前主要保留备用。
+
+# 第二问矩形硬约束：自由拼接候选必须先像一个矩形，再进入评分排序。
+SECOND_Q_RECTLIKE_REJECT_ENABLED = True
+SECOND_Q_RECTLIKE_MIN_FILL_RATIO = 0.88       # union 面积 / 最小外接矩形面积，低于它说明有坑或拼得散。
+SECOND_Q_RECTLIKE_MAX_HULL_GAP_RATIO = 0.06   # 凸包比真实外轮廓多出的比例，尖顶/凹坑会明显变大。
+SECOND_Q_RECTLIKE_MAX_CONTOUR_POINTS = 6      # 外轮廓近似点数上限；允许轻微噪声，但拒绝明显多边形。
+SECOND_Q_RECTLIKE_MAX_ASPECT_ERROR = 0.22     # 长宽比相对 10:6 的 log 误差上限。
+
+# 第二问调试输出和现场排查参数。
+SECOND_Q_DEBUG_TOP_N = 5               # 打印/保留评分前几名组合。
+SECOND_Q_DEBUG_CANDIDATES = False      # 是否打印全部候选边；现场运行关闭以避免刷屏拖慢。
+SECOND_Q_DEBUG_MAX_CAND_PRINT = 60     # 每对碎片最多打印多少个候选。
+SECOND_Q_SOLVE_PROGRESS_INTERVAL = 0   # 求解进度打印间隔；0 表示关闭，避免串口输出拖慢。
+SECOND_Q_DEBUG_SHORT_EDGE_PX = 20.0    # 调试时提示短边的阈值，单位像素。
 SECOND_Q_EDGE_CONTACT_MAX_ERROR_PX = 24.0
 SECOND_Q_EDGE_CONTACT_WEIGHT = 20.0
 SECOND_Q_HULL_GAP_WEIGHT = 80.0
@@ -182,40 +244,57 @@ SECOND_Q_TWO_PIECE_MAX_OVERLAP_RATIO = 0.04
 SECOND_Q_STRICT_BOUNDARY_REJECT = False
 SECOND_Q_STRICT_EDGE_CONTACT_REJECT = False
 
-A4_RATIO_MIN = 1.25
-A4_RATIO_MAX = 1.65
-ANGLE_MIN = 65.0
-ANGLE_MAX = 115.0
+# A4 外框形状合理性限制。
+A4_RATIO_MIN = 1.25                    # A4 长宽比下限，防止非 A4 四边形误检。
+A4_RATIO_MAX = 1.65                    # A4 长宽比上限。
+ANGLE_MIN = 65.0                       # A4 四个角允许的最小角度，单位度。
+ANGLE_MAX = 115.0                      # A4 四个角允许的最大角度，单位度。
 
-PRINT_INTERVAL_MS = 500
-PRINT_MOVE_ONLY = True
-SHOW_DEBUG_INFO = False
-ENABLE_KEY_EXIT = True
-SEND_SERIAL_ON_KEY_PRESS = True
-PERF_PROFILE = True
-CAPTURE_FRAME_COUNT = 60
-CAPTURE_HOLD_MS = 65000
-CAPTURE_MIN_VALID_FRAMES = 2
-CAPTURE_OUTLIER_A4_CORNER_PX = 25.0
-CAPTURE_OUTLIER_CENTER_PX = 35.0
-CAPTURE_OUTLIER_ROTATE_DEG = 25.0
+# 打印、按键和性能调试参数。
+PRINT_INTERVAL_MS = 500                # 终端/串口打印最小间隔，单位毫秒。
+PRINT_MOVE_ONLY = True                 # 只在结果变化时打印，避免刷屏。
+SHOW_DEBUG_INFO = False                # 是否在画面叠加详细调试信息。
+ENABLE_KEY_EXIT = True                 # 是否允许按键退出程序。
+AUTO_CAPTURE_ON_START = True           # 程序启动后是否自动执行一次稳定捕获并发送结果。
+SEND_SERIAL_ON_KEY_PRESS = True        # 是否保留按键再次触发捕获/发送。
+PERF_PROFILE = True                    # 是否统计每帧处理耗时。
 
-SERIAL_OUTPUT_ENABLED = True
-SERIAL_PORT = "/dev/ttyS4"
-SERIAL_BAUDRATE = 115200
-SERIAL_OUTPUT_FORMAT = "binary"  # gcode, binary, text
-GCODE_FEEDRATE = 3000
-GCODE_TRAVEL_FEEDRATE = 5000
-GCODE_PEN_UP_Z = 5.0
-GCODE_PEN_DOWN_Z = 0.0
-GCODE_ROTATE_AXIS = "A"
+# 稳定捕获参数；自动执行或按键触发后连续采集多帧，剔除离群值后输出稳定结果。
+CAPTURE_FRAME_COUNT = 60               # 一次捕获最多处理帧数。
+CAPTURE_HOLD_MS = 120000                # 捕获最长等待时间，单位毫秒。
+CAPTURE_MIN_VALID_FRAMES = 2           # 至少需要多少帧有效识别结果。
+CAPTURE_OUTLIER_A4_CORNER_PX = 25.0    # A4 角点离群阈值，单位像素。
+CAPTURE_OUTLIER_CENTER_PX = 35.0       # 碎片中心离群阈值，单位像素。
+CAPTURE_OUTLIER_ROTATE_DEG = 25.0      # 旋转角离群阈值，单位度。
+
+# 串口和 G-code 输出参数。
+SERIAL_OUTPUT_ENABLED = True           # 是否启用串口输出。
+SERIAL_PORT = "/dev/ttyS4"             # MaixCAM 上连接下位机的串口设备。
+SERIAL_BAUDRATE = 115200               # 串口波特率。
+SERIAL_OUTPUT_FORMAT = "binary"        # 输出格式：gcode、binary、text。
+GCODE_FEEDRATE = 3000                  # G-code 加工/下笔进给速度。
+GCODE_TRAVEL_FEEDRATE = 5000           # G-code 空走移动速度。
+GCODE_PEN_UP_Z = 5.0                   # G-code 抬笔高度。
+GCODE_PEN_DOWN_Z = 0.0                 # G-code 下笔高度。
+GCODE_ROTATE_AXIS = "A"                # G-code 中使用的旋转轴名称。
 
 # 机械坐标标定点，顺序是标准 A4 透视图里的 TL/TR/BR/BL。
 # 默认值表示以 A4 左上角为机械原点，单位 mm；实车标定时改成机械端实测坐标。
-MECH_COORD_OUTPUT_ENABLED = True
-MECH_SWAP_XY_FOR_STM32 = True
-MECH_COORD_DECIMALS = 0
-MECH_ROTATE_SCALE = 10.0
+MECH_COORD_OUTPUT_ENABLED = True       # 是否输出机械坐标。
+MECH_SWAP_XY_FOR_STM32 = True          # 是否交换 X/Y，适配 STM32 端坐标定义。
+MECH_COORD_DECIMALS = 0                # 机械坐标输出保留小数位数。
+MECH_ROTATE_SCALE = 10.0               # 旋转角缩放倍数，适配下位机协议。
+# 机械端系统误差补偿:如果抓取点/放置点都偏向 A4 中线,说明横向比例略小或机械端有固定回缩。
+# scale > 1 会把点按 A4 中心成比例向外推;outward_mm 会按所在方向额外远离中心固定距离。
+MECH_CENTERLINE_COMPENSATION_ENABLED = True # 是否启用中心偏差补偿。
+
+MECH_CENTERLINE_X_SCALE = 1.00         # 横向离中线距离放大倍率；偏中线就调大，偏外侧就调小。
+MECH_CENTERLINE_X_OUTWARD_MM = 3.0     # 左右两侧各自远离中线的固定补偿，单位 mm。
+MECH_CENTERLINE_X_OFFSET_MM = -1.0     # 横向整体平移补偿，单位 mm；左右都同向偏时再调它。+往右 -往左
+
+MECH_CENTERLINE_Y_SCALE = 1.05         # 纵向离中心线距离放大倍率；偏中心就调大，偏外侧就调小。
+MECH_CENTERLINE_Y_OUTWARD_MM = 0.0     # 上下两侧各自远离中心线的固定补偿，单位 mm。
+MECH_CENTERLINE_Y_OFFSET_MM = 2.0      # 纵向整体平移补偿，单位 mm；+往下 -往上。
 MECH_CALIBRATION_POINTS = [
     [0.0, 0.0],
     [A4_W_MM, 0.0],
@@ -231,6 +310,7 @@ DEBUG_SHOW_ORIGINAL_PROCESS = 1
 # 调试视图保留给现场排查，常规阶段 2 显示由 DISPLAY_MODE 控制。
 DEBUG_VIEW_MODE = 0
 
+# OpenCV 绘图颜色，顺序是 BGR，不是 RGB。
 GREEN = (0, 255, 0)
 RED = (0, 0, 255)
 YELLOW = (0, 255, 255)
@@ -239,16 +319,19 @@ BLACK = (0, 0, 0)
 BLUE = (255, 0, 0)
 CYAN = (255, 255, 0)
 
-capture_requested = False
-first_question_area_ratios_cache = None
-first_question_template_contour_cache = {}
-first_question_target_layout_cache = {}
-rotation_target_sample_cache = {}
+# 运行时状态和缓存，避免每帧重复计算固定模板。
+capture_requested = AUTO_CAPTURE_ON_START  # 是否已经请求一次稳定捕获；启动自动执行时初始为 True。
+first_question_area_ratios_cache = None     # 第一问模板面积比例缓存。
+first_question_template_contour_cache = {}  # 第一问模板轮廓缓存。
+first_question_target_layout_cache = {}     # 第一问目标布局缓存。
+rotation_target_sample_cache = {}           # 旋转匹配采样点缓存。
 
 
 # =========================
 # Geometry
 # =========================
+# 基础几何工具：点排序、距离/角度、A4 透视矩阵、透视矫正。
+# 这些函数不依赖题目逻辑，是后面检测、匹配、机械坐标换算的公共基础。
 
 def order_points(points):
     pts = np.asarray(points, dtype=np.float32).reshape(4, 2)
@@ -301,7 +384,6 @@ def quad_aspect_ratio(corners):
     if min(width, height) <= 1e-6:
         return 0.0
     return max(width, height) / min(width, height)
-
 
 def standard_midline():
     x = WARP_W // 2
@@ -473,6 +555,11 @@ class A4ResultStabilizer:
 # Puzzle piece detector
 # =========================
 
+# =========================
+# Piece Detection
+# =========================
+# 碎片检测主入口：在 A4 透视图中生成 mask、找轮廓、拟合多边形，
+# 最后输出每块碎片的像素坐标、中心点、角度和调试信息。
 def detect_pieces(frame, corners, matrix):
     if not PIECE_DETECTION_ENABLED:
         return [], [], make_empty_piece_debug()
@@ -531,13 +618,14 @@ def detect_pieces(frame, corners, matrix):
         x, y, w, h = cv2.boundingRect(contour)
         if w < PIECE_MIN_BBOX_SIDE or h < PIECE_MIN_BBOX_SIDE:
             continue
-        if (
-            x <= PIECE_BORDER_MARGIN
-            or y <= PIECE_BORDER_MARGIN
-            or x + w >= frame_w - PIECE_BORDER_MARGIN
-            or y + h >= frame_h - PIECE_BORDER_MARGIN
-        ):
-            continue
+        if not PIECE_ALLOW_A4_EDGE_TOUCH:
+            if (
+                x <= PIECE_BORDER_MARGIN
+                or y <= PIECE_BORDER_MARGIN
+                or x + w >= frame_w - PIECE_BORDER_MARGIN
+                or y + h >= frame_h - PIECE_BORDER_MARGIN
+            ):
+                continue
 
         bbox_ratio = max(w, h) / max(1.0, float(min(w, h)))
         if bbox_ratio > PIECE_MAX_ASPECT_RATIO:
@@ -741,6 +829,7 @@ def expand_roi_image(image_roi, roi, shape, dtype):
     return image
 
 
+# 根据当前配置选择碎片分割方式。black/hsv/lab 三套方法共用同一套后处理流程。
 def make_piece_mask(frame, detect_mask):
     if PIECE_MASK_METHOD == "hsv":
         return make_piece_mask_hsv(frame, detect_mask)
@@ -852,6 +941,11 @@ def split_touching_piece_mask(raw_mask, detect_mask):
     return split_mask
 
 
+# =========================
+# First Question Solver
+# =========================
+# 第一问：把检测到的碎片和固定 A/B/C/D 模板匹配，
+# 再计算每块应该移动到 10 cm x 6 cm 目标矩形中的哪个位置。
 def first_question_template_scores(contour):
     if contour is None or len(contour) < 3:
         return []
@@ -987,6 +1081,84 @@ def attach_first_question_targets(pieces):
             "rotate_deg": round(rotate_deg, 1),
             "rotate_method": rotation_method,
         }
+
+
+def second_question_first_template_match(pieces):
+    """第二问中识别第一问官方 A/B/C/D 切法,命中时返回最佳模板分配。"""
+    if (
+        not SECOND_Q_FIRST_TEMPLATE_DETECT_ENABLED
+        or len(pieces) != len(FIRST_Q_TEMPLATES)
+    ):
+        return None
+
+    template_ratios = cached_first_question_template_area_ratios()
+    piece_infos = []
+    total_area = 0.0
+    for piece in pieces:
+        polygon = np.asarray(piece.get("polygon", []), dtype=np.float32).reshape(-1, 2)
+        if len(polygon) < 3:
+            return None
+        contour = polygon.reshape(-1, 1, 2)
+        area = float(piece.get("area", 0))
+        if area <= 0.0:
+            area = abs(float(cv2.contourArea(contour)))
+        total_area += max(0.0, area)
+        scores = first_question_template_scores(contour)
+        piece_infos.append({
+            "area": max(0.0, area),
+            "points": int(piece.get("points", len(polygon))),
+            "scores": scores,
+        })
+    total_area = max(1.0, total_area)
+
+    best = None
+    for template_indices in itertools.permutations(range(len(FIRST_Q_TEMPLATES))):
+        cost = 0.0
+        max_shape_score = 0.0
+        details = []
+        for piece_index, template_index in enumerate(template_indices):
+            info = piece_infos[piece_index]
+            shape_score = 999.0
+            for score in info["scores"]:
+                if score["index"] == template_index:
+                    shape_score = float(score["shape_score"])
+                    break
+            area_ratio = info["area"] / total_area
+            area_score = template_area_match_score(area_ratio, template_ratios[template_index])
+            point_score = abs(info["points"] - len(FIRST_Q_TEMPLATES[template_index]["polygon_cm"]))
+            item_cost = (
+                shape_score
+                + SECOND_Q_FIRST_TEMPLATE_AREA_WEIGHT * min(area_score, 0.60)
+                + SECOND_Q_FIRST_TEMPLATE_POINT_WEIGHT * point_score
+            )
+            cost += item_cost
+            max_shape_score = max(max_shape_score, shape_score)
+            details.append({
+                "piece": piece_index,
+                "template_index": template_index,
+                "template": FIRST_Q_TEMPLATES[template_index]["name"],
+                "shape_score": shape_score,
+                "area_ratio": area_ratio,
+                "area_score": area_score,
+                "point_score": point_score,
+                "cost": item_cost,
+            })
+        if best is None or cost < best["cost"]:
+            best = {
+                "assignment": template_indices,
+                "cost": cost,
+                "max_shape_score": max_shape_score,
+                "details": details,
+            }
+
+    if best is None:
+        return None
+    if best["cost"] > SECOND_Q_FIRST_TEMPLATE_MAX_COST:
+        return None
+    if best["max_shape_score"] > SECOND_Q_FIRST_TEMPLATE_MAX_SHAPE_SCORE:
+        return None
+    return best
+
 
 
 def choose_first_question_target_side(pieces):
@@ -1455,6 +1627,11 @@ def align_edge_transform(src_a, src_b, dst_a, dst_b):
     return transform
 
 
+# =========================
+# Second Question Solver
+# =========================
+# 第二问：不依赖固定模板，使用碎片边长、T 形局部边、复合边、
+# 光栅化矩形评分来枚举并筛选最可能的拼接方案。
 def second_question_target_origin(target_side=None, target_size=None):
     target_side = target_side or SECOND_Q_TARGET_SIDE
     if target_side == "auto":
@@ -1659,6 +1836,8 @@ def second_question_edge_endpoint_vertices(edge_ref, point_count):
     return int(edge_ref) % point_count, (int(edge_ref) + 1) % point_count
 
 
+# 生成候选边匹配：包含完整边匹配、T 形局部边匹配，以及多段复合边匹配。
+# 候选只表示“可能相邻”，最终真假由全局矩形评分决定。
 def second_question_candidate_matchings(pieces):
     all_edges = {}
     for piece_index, piece in enumerate(pieces):
@@ -1820,7 +1999,17 @@ def second_question_match_segments(pieces, match):
     )
 
 
-def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_scored=SECOND_Q_MAX_SCORED_COMBOS):
+# 从候选边中枚举可连通的组合。这里用惩罚预算和 heap 只保留前 max_scored 个组合，
+# 避免在 MaixCAM 上一次性保存过多组合导致内存压力。
+def second_question_matching_sets(
+    pieces,
+    candidates=None,
+    cut_mode="auto",
+    max_scored=SECOND_Q_MAX_SCORED_COMBOS,
+    allowed_pairs=None,
+    pair_candidate_limit=None,
+    tree_only=False,
+):
     """按碎片对拓扑枚举匹配组合:full/partial 任意混合,|E| = N-1 或 N。
 
     邻接对偶图可以是树(N-1)或带一个环(N,如共顶点族/双T链),环上的
@@ -1834,12 +2023,19 @@ def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_
         return
     if candidates is None:
         candidates = second_question_candidate_matchings(pieces)
+    allowed_pairs = None if allowed_pairs is None else {tuple(sorted(pair)) for pair in allowed_pairs}
     by_pair = {}
     for match in candidates:
-        by_pair.setdefault((match[1], match[3]), []).append(match)
+        pair = tuple(sorted((match[1], match[3])))
+        if allowed_pairs is not None and pair not in allowed_pairs:
+            continue
+        group = by_pair.setdefault(pair, [])
+        if pair_candidate_limit is None or len(group) < int(pair_candidate_limit):
+            group.append(match)
     # 预计算每个候选的边区间占用,避免递归内重复调用辅助函数(枚举是耗时大头)
+    active_candidates = [match for matches in by_pair.values() for match in matches]
     claims_cache = {}
-    for match in candidates:
+    for match in active_candidates:
         _, piece_i, edge_i, piece_j, edge_j, ia0, ia1, ja0, ja1 = match
         claims = [
             (piece_i, component, start_t, end_t)
@@ -1854,6 +2050,7 @@ def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_
         claims_cache[match] = claims
     pair_list = sorted(by_pair)
     valid = []
+    valid_sequence = 0
 
     def connected(topo):
         degree = [0] * count
@@ -1873,7 +2070,8 @@ def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_
                     stack.append(neighbor)
         return len(seen) == count
 
-    for size in (count - 1, count):
+    topology_sizes = (count - 1,) if tree_only else (count - 1, count)
+    for size in topology_sizes:
         if size < 1 or size > len(pair_list):
             continue
         for topo in itertools.combinations(pair_list, size):
@@ -1884,7 +2082,14 @@ def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_
 
             def rec(index, penalty):
                 if index == len(topo):
-                    valid.append((penalty, tuple(chosen)))
+                    nonlocal valid_sequence
+                    combo = tuple(chosen)
+                    entry = (-float(penalty), valid_sequence, combo)
+                    valid_sequence += 1
+                    if len(valid) < max_scored:
+                        heapq.heappush(valid, entry)
+                    elif entry > valid[0]:
+                        heapq.heapreplace(valid, entry)
                     return
                 # 惩罚预算剪枝:超过预算的组合不可能进入最终短名单
                 for match in by_pair[topo[index]]:
@@ -1914,9 +2119,10 @@ def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_
                             del used[(piece_index, component)]
 
             rec(0, 0.0)
-    # 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时
-    valid.sort(key=lambda item: item[0])
-    for _penalty, combo in valid[:max_scored]:
+    # 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时。
+    best = [(-neg_penalty, combo) for neg_penalty, _seq, combo in valid]
+    best.sort(key=lambda item: item[0])
+    for _penalty, combo in best:
         yield combo
 
 
@@ -1931,6 +2137,34 @@ def second_question_format_reject_stats(reject_stats):
     if not reject_stats:
         return "none"
     return ",".join("%s=%d" % (key, reject_stats[key]) for key in sorted(reject_stats))
+
+
+def second_question_rectlike_reject_reason(contour_world, rect_area, union_area, hull_area, aspect, fixed_aspect):
+    if not SECOND_Q_RECTLIKE_REJECT_ENABLED:
+        return None
+    if rect_area <= 1e-6 or union_area <= 1e-6:
+        return "rectlike_empty"
+
+    fill_ratio = float(union_area) / max(1.0, float(rect_area))
+    if fill_ratio < SECOND_Q_RECTLIKE_MIN_FILL_RATIO:
+        return "rectlike_fill"
+
+    hull_gap_ratio = max(0.0, float(hull_area) - float(union_area)) / max(1.0, float(union_area))
+    if hull_gap_ratio > SECOND_Q_RECTLIKE_MAX_HULL_GAP_RATIO:
+        return "rectlike_hull"
+
+    contour = np.asarray(contour_world, dtype=np.float32).reshape(-1, 1, 2)
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 1e-6:
+        return "rectlike_perimeter"
+    approx = cv2.approxPolyDP(contour, SECOND_Q_RECT_APPROX_EPSILON_RATIO * perimeter, True)
+    if len(approx) > SECOND_Q_RECTLIKE_MAX_CONTOUR_POINTS:
+        return "rectlike_points"
+
+    aspect_error = abs(math.log(max(float(aspect), 1e-6) / max(float(fixed_aspect), 1e-6)))
+    if aspect_error > SECOND_Q_RECTLIKE_MAX_ASPECT_ERROR:
+        return "rectlike_aspect"
+    return None
 
 
 def second_question_assemble_from_matches(pieces, matches, reject_stats=None):
@@ -2394,9 +2628,7 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
     if len(assembled) == 2 and hull_gap_ratio > SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO:
         return second_question_reject(reject_stats, "hull")
 
-    # 评分项与参考实现(puzzle_sim.assemble_from_matches)对齐:
-    # 闭环/重叠/填充/面积/长宽比/周长/匹配惩罚。旧版 boundary/right_corner/
-    # edge_contact 附加项会误杀 T 节点与凹片的正确解,已从评分与拒绝中移除。
+    # fast 路径只保留外轮廓近似评分；默认矩形硬约束开启时不会走到这里。
     match_error = sum(float(match[0]) for match in matches) * 3000.0
     score = (
         closure_error * 400.0
@@ -2421,6 +2653,7 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
         "boundary_repair": 0.0,
         "boundary_repair_count": 0,
         "edge_contact": 0.0,
+        "edge_contact_max": 0.0,
         "right_corner": 0.0,
         "right_corner_count": 0,
         "rect_w": float(rect_w),
@@ -2437,7 +2670,7 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
 
 
 def second_question_score_assembly(transforms, assembled, matches, closure_error, reject_stats=None):
-    if SECOND_Q_USE_FAST_GEOMETRY_SCORE:
+    if SECOND_Q_USE_FAST_GEOMETRY_SCORE and not SECOND_Q_RECTLIKE_REJECT_ENABLED:
         return second_question_score_assembly_fast(transforms, assembled, matches, closure_error, reject_stats)
 
     all_points = np.vstack(assembled)
@@ -2499,7 +2732,19 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
         return second_question_reject(reject_stats, "overlap")
     if len(assembled) == 2 and hull_gap_ratio > SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO:
         return second_question_reject(reject_stats, "hull")
-    # 评分项与参考实现对齐(同 fast 路径),附加边界/直角/接触项已移除。
+
+    rectlike_reason = second_question_rectlike_reject_reason(
+        contour_world,
+        rect_area,
+        union_area,
+        hull_area,
+        aspect,
+        fixed_aspect,
+    )
+    if rectlike_reason is not None:
+        return second_question_reject(reject_stats, rectlike_reason)
+
+    # 评分项与参考实现对齐:闭环/重叠/填充/面积/长宽比/周长/匹配惩罚。
     match_error = sum(float(match[0]) for match in matches) * 3000.0
     score = (
         closure_error * 400.0
@@ -2525,6 +2770,7 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
         "boundary_repair": 0.0,
         "boundary_repair_count": 0,
         "edge_contact": 0.0,
+        "edge_contact_max": 0.0,
         "right_corner": 0.0,
         "right_corner_count": 0,
         "rect_w": float(rect_w),
@@ -2712,6 +2958,34 @@ def second_question_congruent_rect_dimensions(pieces):
     return float(first[0]), float(first[1])
 
 
+def second_question_first_template_allowed_pairs(match):
+    if (
+        not SECOND_Q_FIRST_TEMPLATE_TOPOLOGY_FIRST
+        or match is None
+        or len(match.get("assignment", ())) != len(FIRST_Q_TEMPLATES)
+    ):
+        return None
+
+    # 第一问官方切法里的内部相邻关系。这里只约束“哪些碎片可以相邻”,
+    # 具体哪条边怎么贴仍由第二问候选边匹配和矩形评分决定。
+    official_pairs = {
+        ("A", "B"),
+        ("A", "D"),
+        ("B", "C"),
+        ("B", "D"),
+        ("C", "D"),
+    }
+    template_to_piece = {}
+    for piece_index, template_index in enumerate(match["assignment"]):
+        template_to_piece[FIRST_Q_TEMPLATES[template_index]["name"]] = piece_index
+
+    pairs = set()
+    for name_a, name_b in official_pairs:
+        if name_a in template_to_piece and name_b in template_to_piece:
+            pairs.add(tuple(sorted((template_to_piece[name_a], template_to_piece[name_b]))))
+    return pairs or None
+
+
 def second_question_congruent_rect_transforms(pieces):
     """全等矩形碎片直接摆放进目标矩形槽位,不匹配时返回 None。
 
@@ -2769,7 +3043,9 @@ def second_question_congruent_rect_transforms(pieces):
     return transforms
 
 
-def second_question_solve_transforms(piece_polygons):
+# 第二问求解主入口：输入检测到的碎片多边形，输出每块碎片的搬运变换、
+# 归一化矩形位置和边匹配结果。后续 attach_second_question_targets 会把它转成移动计划。
+def second_question_solve_transforms(piece_polygons, first_template_match=None):
     pieces = [np.asarray(polygon, dtype=np.float32).reshape(-1, 2) for polygon in piece_polygons]
     if not 2 <= len(pieces) <= PIECE_MAX_COUNT:
         raise RuntimeError("SECOND Q piece count invalid")
@@ -2785,8 +3061,17 @@ def second_question_solve_transforms(piece_polygons):
         candidates = second_question_candidate_matchings(pieces)
         full_count = len([match for match in candidates if tuple(match[5:]) == (0.0, 1.0, 0.0, 1.0)])
         partial_count = len(candidates) - full_count
-        # 拓扑枚举与切割方式无关,单次 auto 求解即可,不再逐模式重复。
-        cut_modes = ("auto",)
+        preferred_pairs = second_question_first_template_allowed_pairs(first_template_match)
+        search_passes = []
+        if preferred_pairs is not None:
+            search_passes.append((
+                "first_template_topology",
+                preferred_pairs,
+                SECOND_Q_FIRST_TEMPLATE_CANDIDATES_PER_PAIR,
+                SECOND_Q_FIRST_TEMPLATE_MAX_SCORED_COMBOS,
+                True,
+            ))
+        search_passes.append(("auto", None, None, SECOND_Q_MAX_SCORED_COMBOS, False))
         if SECOND_Q_DEBUG_CANDIDATES:
             print("SECOND Q PIECES ver=%s n=%d cand=%d full=%d partial=%d modes=%s" % (
                 SECOND_Q_SOLVER_DEBUG_VERSION,
@@ -2794,7 +3079,7 @@ def second_question_solve_transforms(piece_polygons):
                 len(candidates),
                 full_count,
                 partial_count,
-                ",".join(cut_modes),
+                ",".join(mode for mode, _pairs, _limit, _max_scored, _tree_only in search_passes),
             ))
             second_question_print_piece_edges(pieces)
             second_question_print_candidate_edges(pieces, candidates)
@@ -2805,19 +3090,31 @@ def second_question_solve_transforms(piece_polygons):
         reject_stats = {}
         solve_start_ms = time.ticks_ms()
         solve_timed_out = False
-        for cut_mode in cut_modes:
-            if solve_timed_out:
-                break
+        for cut_mode, allowed_pairs, pair_limit, max_scored, tree_only in search_passes:
+            solve_timed_out = False
             mode_start_tried = tried
             mode_start_accepted = accepted
-            print("SECOND Q MODE START %s" % cut_mode)
-            # 枚举阶段一次性完成(无法中途限时),时间预算只约束评分阶段,
-            # 避免"枚举耗光预算后只评了第一组就超时退出"。
-            combos = list(second_question_matching_sets(pieces, candidates, cut_mode))
-            print("SECOND Q COMBOS mode=%s n=%d enum=%dms" % (
-                cut_mode, len(combos), int(time.ticks_ms() - solve_start_ms)))
+            if allowed_pairs is None:
+                print("SECOND Q MODE START %s" % cut_mode)
+            else:
+                print("SECOND Q MODE START %s pairs=%s" % (
+                    cut_mode,
+                    ",".join("P%d-P%d" % pair for pair in sorted(allowed_pairs)),
+                ))
+            combo_iter = second_question_matching_sets(
+                pieces,
+                candidates,
+                cut_mode,
+                max_scored=max_scored,
+                allowed_pairs=allowed_pairs,
+                pair_candidate_limit=pair_limit,
+                tree_only=tree_only,
+            )
+            enum_elapsed_ms = int(time.ticks_ms() - solve_start_ms)
+            print("SECOND Q COMBOS mode=%s max=%d enum=%dms" % (
+                cut_mode, int(max_scored), enum_elapsed_ms))
             solve_start_ms = time.ticks_ms()
-            for matches in combos:
+            for matches in combo_iter:
                 tried += 1
                 if SECOND_Q_SOLVE_PROGRESS_INTERVAL > 0 and tried % SECOND_Q_SOLVE_PROGRESS_INTERVAL == 0:
                     print(
@@ -2858,6 +3155,11 @@ def second_question_solve_transforms(piece_polygons):
                 "SECOND Q MODE END %s tried=%d accepted=%d elapsed=%dms"
                 % (cut_mode, tried - mode_start_tried, accepted - mode_start_accepted, int(elapsed_ms))
             )
+            if best is not None and allowed_pairs is not None:
+                print("SECOND Q FIRST TEMPLATE TOPOLOGY OK; skip auto fallback")
+                break
+            if best is None and allowed_pairs is not None:
+                print("SECOND Q FIRST TEMPLATE TOPOLOGY FAIL; fallback auto")
         if best is None:
             raise RuntimeError("SECOND Q solve failed mode=%s cand=%d full=%d partial=%d tried=%d accepted=%d reject=%s" % (
                 SECOND_Q_CUT_MODE,
@@ -2914,10 +3216,28 @@ def second_question_solve_transforms(piece_polygons):
 def attach_second_question_targets(pieces):
     if not SECOND_QUESTION_MODE or len(pieces) < 2:
         return False
+
+    first_template_match = second_question_first_template_match(pieces)
+    if first_template_match is not None:
+        summary = []
+        for piece_index, template_index in enumerate(first_template_match["assignment"]):
+            summary.append("P%d=%s" % (piece_index, FIRST_Q_TEMPLATES[template_index]["name"]))
+        print(
+            "SECOND Q DETECT FIRST TEMPLATE cost=%.3f max_shape=%.3f try=template_topology %s"
+            % (
+                float(first_template_match["cost"]),
+                float(first_template_match["max_shape_score"]),
+                " ".join(summary),
+            )
+        )
+
     target_side = choose_second_question_target_side(pieces)
     polygons = [piece.get("polygon", []) for piece in pieces]
     try:
-        transforms, normalize, min_point, target_size, target_rect_points, _matches = second_question_solve_transforms(polygons)
+        transforms, normalize, min_point, target_size, target_rect_points, _matches = second_question_solve_transforms(
+            polygons,
+            first_template_match=first_template_match,
+        )
     except Exception as err:
         print("SECOND Q SOLVE FAIL %s" % err)
         return False
@@ -2993,6 +3313,10 @@ def attach_second_question_targets(pieces):
     return True
 
 
+# =========================
+# Move Planning and Capture Aggregation
+# =========================
+# 把第一/第二问求解结果转换为机械端需要的抓取点、放置点和旋转角。
 def build_move_plan(pieces):
     plan = []
     for piece in pieces:
@@ -3288,6 +3612,10 @@ def bbox_from_polygon(polygon):
     return [int(x), int(y), int(w), int(h)]
 
 
+# =========================
+# Mechanical Coordinate Output
+# =========================
+# 将 A4 透视图像素坐标映射到机械坐标，并按 STM32 协议格式化输出。
 def mech_calibration_matrix():
     src = np.float32(
         [
@@ -3301,12 +3629,39 @@ def mech_calibration_matrix():
     return cv2.getPerspectiveTransform(src, dst)
 
 
+def compensate_centerline_bias(point):
+    """补偿抓取/放置都向 A4 中心偏的系统误差。"""
+    corrected = np.asarray(point, dtype=np.float32).copy()
+    if MECH_CENTERLINE_COMPENSATION_ENABLED:
+        center_x = (WARP_W - 1.0) * 0.5
+        center_y = (WARP_H - 1.0) * 0.5
+        px_per_mm_x = (WARP_W - 1.0) / A4_W_MM
+        px_per_mm_y = (WARP_H - 1.0) / A4_H_MM
+
+        dx = float(corrected[0] - center_x)
+        corrected[0] = center_x + dx * float(MECH_CENTERLINE_X_SCALE)
+        if abs(dx) > 1e-6:
+            corrected[0] += np.sign(dx) * float(MECH_CENTERLINE_X_OUTWARD_MM) * px_per_mm_x
+        corrected[0] += float(MECH_CENTERLINE_X_OFFSET_MM) * px_per_mm_x
+        corrected[0] = max(0.0, min(float(corrected[0]), WARP_W - 1.0))
+
+        dy = float(corrected[1] - center_y)
+        corrected[1] = center_y + dy * float(MECH_CENTERLINE_Y_SCALE)
+        if abs(dy) > 1e-6:
+            corrected[1] += np.sign(dy) * float(MECH_CENTERLINE_Y_OUTWARD_MM) * px_per_mm_y
+        corrected[1] += float(MECH_CENTERLINE_Y_OFFSET_MM) * px_per_mm_y
+        corrected[1] = max(0.0, min(float(corrected[1]), WARP_H - 1.0))
+    return corrected
+
+
 def warp_to_mech_point(point):
     if not MECH_COORD_OUTPUT_ENABLED:
-        return format_output_mech_point([float(point[0]), float(point[1])])
+        corrected = compensate_centerline_bias(point)
+        return format_output_mech_point([float(corrected[0]), float(corrected[1])])
 
     matrix = mech_calibration_matrix()
-    src = np.float32([[[float(point[0]), float(point[1])]]])
+    corrected = compensate_centerline_bias(point)
+    src = np.float32([[[float(corrected[0]), float(corrected[1])]]])
     dst = cv2.perspectiveTransform(src, matrix)[0][0]
     return format_output_mech_point([float(dst[0]), float(dst[1])])
 
@@ -3637,7 +3992,8 @@ def make_a4_inner_mask(shape, corners):
     mask = np.zeros(shape, dtype=np.uint8)
     corners_array = np.asarray(corners, dtype=np.float32)
     center = np.mean(corners_array, axis=0)
-    inner = center + (corners_array - center) * 0.97
+    inner_scale = float(PIECE_A4_MASK_INNER_SCALE)
+    inner = center + (corners_array - center) * inner_scale
     cv2.fillPoly(mask, [inner.astype(np.int32)], 255)
     if PIECE_FRAME_MASK_MARGIN > 0:
         kernel_size = PIECE_FRAME_MASK_MARGIN * 2 + 1
@@ -3810,6 +4166,10 @@ def line_intersection(a0, a1, b0, b1):
 # Draw / app
 # =========================
 
+# =========================
+# Display and Debug Views
+# =========================
+# 现场显示和调试画面绘制：原图、透视图、碎片编号、目标位置、mask 和性能信息。
 def draw_text_bg(frame, x, y, text, color, scale=0.55):
     (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
     cv2.rectangle(frame, (x - 3, y - h - 4), (x + w + 3, y + 4), BLACK, -1)
@@ -4117,6 +4477,11 @@ def create_serial():
         return None
 
 
+# =========================
+# Main Loop
+# =========================
+# MaixCAM 主循环：采集图像、检测 A4、识别碎片、按键触发稳定捕获、
+# 生成移动计划并通过串口发送给下位机。
 def main():
     global capture_requested
 
@@ -4150,6 +4515,8 @@ def main():
     held_matrix = None
     held_until_ms = 0
     capture_wait_logged = False
+    if AUTO_CAPTURE_ON_START:
+        print("AUTO CAPTURE ENABLED")
 
     while not app.need_exit():
         loop_start_ms = time.ticks_ms()
