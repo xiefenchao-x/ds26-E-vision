@@ -186,7 +186,7 @@ SECOND_Q_USE_FAST_GEOMETRY_SCORE = False
 # Use "all_reference" to scan the reference simulator's named modes.
 SECOND_Q_CUT_MODE = "branched_spine"   # 当前优先使用的参考拓扑名称，实际求解阶段会走 auto 枚举。
 SECOND_Q_REFERENCE_MATCHING = True     # 是否启用参考拓扑风格的边匹配策略。
-SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v16" # 调试输出中的求解器版本标记。
+SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v16-aspectsoft" # 调试输出中的求解器版本标记。
 # 第二问遇到第一问官方切法时先按官方邻接拓扑跑第二问算法,失败再回全量通用搜索。
 SECOND_Q_FIRST_TEMPLATE_DETECT_ENABLED = True
 SECOND_Q_FIRST_TEMPLATE_TOPOLOGY_FIRST = True
@@ -309,6 +309,10 @@ DEBUG_SHOW_ORIGINAL_PROCESS = 1
 
 # 调试视图保留给现场排查，常规阶段 2 显示由 DISPLAY_MODE 控制。
 DEBUG_VIEW_MODE = 0
+
+# 目标预览贴图：把左侧检测到的碎片图案也变换到右侧目标位置，便于检查花纹方向。
+PREVIEW_TEXTURE_ENABLED = True
+PREVIEW_TEXTURE_ALPHA = 1.0
 
 # OpenCV 绘图颜色，顺序是 BGR，不是 RGB。
 GREEN = (0, 255, 0)
@@ -2161,9 +2165,8 @@ def second_question_rectlike_reject_reason(contour_world, rect_area, union_area,
     if len(approx) > SECOND_Q_RECTLIKE_MAX_CONTOUR_POINTS:
         return "rectlike_points"
 
-    aspect_error = abs(math.log(max(float(aspect), 1e-6) / max(float(fixed_aspect), 1e-6)))
-    if aspect_error > SECOND_Q_RECTLIKE_MAX_ASPECT_ERROR:
-        return "rectlike_aspect"
+    # 长宽比受碎片缺角、阴影缝和 minAreaRect 方向影响很大；这里不能一票否决。
+    # 具体偏离量继续在 second_question_score_assembly() 里作为软评分项处理。
     return None
 
 
@@ -4208,6 +4211,57 @@ def draw_pieces(frame, pieces, piece_contours):
         cv2.putText(frame, label, (cx + 5, max(12, cy - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BLUE, 1)
 
 
+def piece_preview_transform(source_polygon, target_polygon):
+    source = np.asarray(source_polygon, dtype=np.float32).reshape(-1, 2)
+    target = np.asarray(target_polygon, dtype=np.float32).reshape(-1, 2)
+    if len(source) < 3 or len(target) < 3 or len(source) != len(target):
+        return None, None
+    if len(source) == 3:
+        matrix = cv2.getAffineTransform(source[:3], target[:3])
+        return matrix, "affine"
+    matrix, _ = cv2.findHomography(source, target, 0)
+    if matrix is None:
+        return None, None
+    return matrix.astype(np.float32), "homography"
+
+
+def draw_target_texture_preview(frame, source_view, pieces):
+    if not PREVIEW_TEXTURE_ENABLED or source_view is None:
+        return
+    height, width = frame.shape[:2]
+    for piece in pieces or []:
+        source_polygon = piece.get("polygon")
+        target_polygon = piece.get("target_detected_polygon") or piece.get("final_detected_polygon")
+        if not source_polygon or not target_polygon:
+            continue
+        transform, transform_kind = piece_preview_transform(source_polygon, target_polygon)
+        if transform is None:
+            continue
+
+        source_mask = np.zeros(source_view.shape[:2], dtype=np.uint8)
+        source_contour = np.asarray(source_polygon, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(source_mask, [source_contour], 255)
+        source_pixels = cv2.bitwise_and(source_view, source_view, mask=source_mask)
+
+        if transform_kind == "affine":
+            warped_pixels = cv2.warpAffine(source_pixels, transform, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+            warped_mask = cv2.warpAffine(source_mask, transform, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+        else:
+            warped_pixels = cv2.warpPerspective(source_pixels, transform, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+            warped_mask = cv2.warpPerspective(source_mask, transform, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+
+        target_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        target_contour = np.asarray(target_polygon, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(target_mask, [target_contour], 255)
+        warped_mask = cv2.bitwise_and(warped_mask, target_mask)
+        if PREVIEW_TEXTURE_ALPHA >= 0.999:
+            frame[warped_mask > 0] = warped_pixels[warped_mask > 0]
+        else:
+            alpha = float(PREVIEW_TEXTURE_ALPHA)
+            mask = warped_mask > 0
+            frame[mask] = (frame[mask].astype(np.float32) * (1.0 - alpha) + warped_pixels[mask].astype(np.float32) * alpha).astype(np.uint8)
+
+
 def draw_question_targets(frame, pieces):
     if SECOND_QUESTION_MODE:
         draw_second_question_targets(frame, pieces)
@@ -4371,7 +4425,7 @@ def make_debug_view(frame, debug):
     return frame.copy()
 
 
-def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_contours=None, piece_debug=None):
+def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_contours=None, piece_debug=None, texture_source=None):
     piece_debug = piece_debug or make_empty_piece_debug()
 
     if result.get("status") and DISPLAY_MODE == 2:
@@ -4412,6 +4466,8 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
             draw_original_result(view, result, fps)
         else:
             view = a4_warp.copy() if a4_warp is not None else warp_a4(frame, result["corners"])[0]
+            source_view = texture_source if texture_source is not None else view
+            draw_target_texture_preview(view, source_view, pieces or [])
             cv2.drawContours(view, piece_debug.get("accepted_source_contours", []), -1, RED, 1)
             draw_question_targets(view, pieces or [])
             draw_pieces(view, pieces or [], piece_contours or [])
@@ -4421,6 +4477,8 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
 
     if DISPLAY_MODE == 1 and result.get("status"):
         view = a4_warp.copy() if a4_warp is not None else warp_a4(frame, result["corners"])[0]
+        source_view = texture_source if texture_source is not None else view
+        draw_target_texture_preview(view, source_view, pieces or [])
         draw_question_targets(view, pieces or [])
         draw_pieces(view, pieces or [], piece_contours or [])
         draw_warp_result(view, result, fps)
@@ -4513,6 +4571,7 @@ def main():
     held_result = None
     held_piece_contours = []
     held_matrix = None
+    held_a4_warp = None
     held_until_ms = 0
     capture_wait_logged = False
     if AUTO_CAPTURE_ON_START:
@@ -4564,6 +4623,7 @@ def main():
                         held_result = aggregated_result
                         held_piece_contours = aggregated_contours
                         held_matrix, _ = a4_perspective_matrices(held_result["corners"])
+                        held_a4_warp = cv2.warpPerspective(frame, held_matrix, (WARP_W, WARP_H))
                         held_until_ms = now_for_capture + CAPTURE_HOLD_MS
                         output_result = held_result
                         pieces = held_result.get("pieces", [])
@@ -4574,6 +4634,7 @@ def main():
                         held_result = None
                         held_piece_contours = []
                         held_matrix = None
+                        held_a4_warp = None
                         held_until_ms = 0
                         print("CAPTURE FAIL valid=%d" % len(capture_samples))
             elif held_result is not None and now_for_capture <= held_until_ms:
@@ -4584,6 +4645,7 @@ def main():
                 held_result = None
                 held_piece_contours = []
                 held_matrix = None
+                held_a4_warp = None
                 held_until_ms = 0
             pieces_end_ms = time.ticks_ms()
         else:
@@ -4599,6 +4661,7 @@ def main():
                 held_result = None
                 held_piece_contours = []
                 held_matrix = None
+                held_a4_warp = None
                 held_until_ms = 0
             matrix_start_ms = matrix_end_ms = time.ticks_ms()
             pieces_start_ms = pieces_end_ms = matrix_end_ms
@@ -4607,17 +4670,19 @@ def main():
         display_start_ms = time.ticks_ms()
         display_result = result
         display_matrix = matrix
+        texture_source = None
         if output_result is held_result and held_matrix is not None:
             display_result = held_result
             display_matrix = held_matrix
+            texture_source = held_a4_warp
         elif output_result is not result and result.get("status"):
             display_result = result.copy()
             display_result["pieces_count"] = output_result.get("pieces_count", 0)
             display_result["pieces"] = output_result.get("pieces", [])
             display_result["move_plan"] = output_result.get("move_plan", [])
-        if display_matrix is not None and display_requires_a4_warp(display_result):
+        if a4_warp is None and display_matrix is not None and display_requires_a4_warp(display_result):
             a4_warp = cv2.warpPerspective(frame, display_matrix, (WARP_W, WARP_H))
-        view = make_display_view(frame, display_result, fps, a4_warp, pieces, piece_contours, piece_debug)
+        view = make_display_view(frame, display_result, fps, a4_warp, pieces, piece_contours, piece_debug, texture_source)
         disp.show(image.cv2image(view, bgr=True, copy=True))
         display_end_ms = time.ticks_ms()
 
