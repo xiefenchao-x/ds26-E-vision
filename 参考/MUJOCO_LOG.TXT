@@ -1,0 +1,6 @@
+ERROR Fri Jul 31 16:06:44 2026: could not create window
+
+ERROR Fri Jul 31 16:07:23 2026: could not create window
+
+ERROR Fri Jul 31 16:07:41 2026: could not create window
+

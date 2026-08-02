@@ -13,96 +13,120 @@ import struct
 # =========================
 # Config: MaixCAM2 OpenCV A4
 # =========================
+# 第一题主配置区：完成摄像头采集、A4 纸透视矫正、碎片识别、模板匹配和坐标输出。
 
+# 摄像头输入分辨率，单位像素；分辨率越高识别更细，但处理速度更慢。
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+
+# A4 纸透视矫正后的标准画布大小，单位像素。
+# 程序检测到 A4 四角后，会把纸面拉正到这个尺寸，后续所有碎片坐标都基于它。
 WARP_W = 594
 WARP_H = 420
+
+# A4 纸真实尺寸，cm 用于题目尺寸描述，mm 用于机械坐标/串口输出。
 A4_W_CM = 29.7
 A4_H_CM = 21.0
 A4_W_MM = A4_W_CM * 10.0
 A4_H_MM = A4_H_CM * 10.0
 
-GAUSSIAN_KERNEL = (5, 5)
-CANNY_LOW = 50
-CANNY_HIGH = 150
-MORPH_CLOSE_KERNEL = (5, 5)
-MORPH_CLOSE_ITERATIONS = 1
+# A4 外框边缘检测预处理参数。
+GAUSSIAN_KERNEL = (5, 5)       # 高斯模糊核，先降噪，避免 Canny 检出太多杂边。
+CANNY_LOW = 50                 # Canny 低阈值，影响弱边缘保留程度。
+CANNY_HIGH = 150               # Canny 高阈值，影响强边缘判定。
+MORPH_CLOSE_KERNEL = (5, 5)    # 闭运算核，用来连接断开的 A4 纸边缘。
+MORPH_CLOSE_ITERATIONS = 1     # 闭运算次数，过大会让不该连接的轮廓粘在一起。
 
-APPROX_EPSILON_RATIO = 0.025
-MIN_AREA_RATIO = 0.07
-MAX_AREA_RATIO = 0.65
+# A4 候选轮廓筛选参数。
+APPROX_EPSILON_RATIO = 0.025   # 四边形拟合精度比例，越大轮廓越容易被简化。
+MIN_AREA_RATIO = 0.07          # A4 候选最小面积占整帧比例，过滤小噪声。
+MAX_AREA_RATIO = 0.65          # A4 候选最大面积占整帧比例，过滤异常大区域。
 
 # 防止把中间黑线分出的半张纸当成 A4。
 # 如果同一帧里存在更大的 A4 外轮廓，即使它没有拟合成四边形，小候选也会被过滤。
 CANDIDATE_MIN_RELATIVE_AREA = 0.65
 
+# A4 外框允许连续丢失的帧数；短暂遮挡/抖动时不立即清空检测状态。
 MAX_LOST_FRAMES = 5
 
-PIECE_DETECTION_ENABLED = True
-QUESTION_MODE = 2
-FIRST_QUESTION_MODE = QUESTION_MODE == 1
-SECOND_QUESTION_MODE = QUESTION_MODE == 2
-PIECE_MASK_METHOD = "black"
-PIECE_PROCESS_A4_ROI = True
-PIECE_BG_BORDER_SAMPLE = 24
-PIECE_BG_DIFF_THRESHOLD = 35.0
-PIECE_L_DIFF_WEIGHT = 0.25
-PIECE_A_DIFF_WEIGHT = 1.0
-PIECE_B_DIFF_WEIGHT = 1.0
-PIECE_GREEN_H_LOW = 51
-PIECE_GREEN_H_HIGH = 91
-PIECE_GREEN_S_LOW = 52
-PIECE_GREEN_S_HIGH = 255
-PIECE_GREEN_V_LOW = 75
-PIECE_GREEN_V_HIGH = 255
-PIECE_HSV_DIFF_THRESHOLD = 35.0
-PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)
-# Black A4 mode: keep this low enough to preserve shaded/low-reflectance corners.
-PIECE_BLACK_V_MIN_THRESHOLD = 90
-PIECE_BLACK_V_OFFSET = 55
-PIECE_BLACK_BLUR_KERNEL = (3, 3)
-PIECE_MASK_MEDIAN_KERNEL = 3
-PIECE_MASK_OPEN_KERNEL = (3, 3)
-PIECE_MASK_CLOSE_KERNEL = (3, 3)
+# 碎片识别和第一题模式开关。
+PIECE_DETECTION_ENABLED = True     # 是否启用碎片检测；False 时只显示/检测 A4 外框。
+FIRST_QUESTION_MODE = True         # 是否使用第一题固定 10 cm x 6 cm 模板匹配流程。
+PIECE_MASK_METHOD = "black"        # 碎片分割方式；black 表示基于黑色背景和碎片亮度/颜色差分。
+PIECE_PROCESS_A4_ROI = True        # 是否只处理透视后的 A4 区域，减少画面外干扰。
+
+# 背景采样和 Lab 色差参数。
+PIECE_BG_BORDER_SAMPLE = 24        # 从 A4 边缘向内采样背景的宽度，单位像素。
+PIECE_BG_DIFF_THRESHOLD = 35.0     # 与背景色差超过该阈值才认为可能是碎片。
+PIECE_L_DIFF_WEIGHT = 0.25         # Lab 亮度 L 通道权重，较低可减小阴影/光照影响。
+PIECE_A_DIFF_WEIGHT = 1.0          # Lab a 通道权重，主要描述红绿方向差异。
+PIECE_B_DIFF_WEIGHT = 1.0          # Lab b 通道权重，主要描述黄蓝方向差异。
+
+# HSV 绿色范围；用于识别绿色碎片或绿色纸面特征。
+PIECE_GREEN_H_LOW = 51             # H 色相下限。
+PIECE_GREEN_H_HIGH = 91            # H 色相上限。
+PIECE_GREEN_S_LOW = 52             # S 饱和度下限，太低说明颜色偏灰。
+PIECE_GREEN_S_HIGH = 255           # S 饱和度上限。
+PIECE_GREEN_V_LOW = 75             # V 亮度下限。
+PIECE_GREEN_V_HIGH = 255           # V 亮度上限。
+PIECE_HSV_DIFF_THRESHOLD = 35.0    # HSV 差分阈值，用于辅助判断目标和背景差异。
+PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)# HSV 差分图模糊核，减少小噪点。
+
+# 黑色背景分割参数；现场是黑底时，用 V 通道亮度把碎片从背景中提出来。
+PIECE_BLACK_V_MIN_THRESHOLD = 120  # V 通道绝对亮度阈值，亮于它才可能是碎片。
+PIECE_BLACK_V_OFFSET = 85          # 相对背景亮度偏移，适应不同灯光环境。
+PIECE_BLACK_BLUR_KERNEL = (3, 3)   # 黑底分割前的模糊核。
+
+# 碎片 mask 清理参数。
+PIECE_MASK_MEDIAN_KERNEL = 3       # 中值滤波核，去椒盐噪声。
+PIECE_MASK_OPEN_KERNEL = (3, 3)    # 开运算核，用于去小白点。
+PIECE_MASK_CLOSE_KERNEL = (3, 3)   # 闭运算核，用于补小断口。
 # OPEN 会直接削掉凸出的尖角。背景差分已经比较干净，默认关闭，只保留一次小核 CLOSE 补断口。
 PIECE_MASK_OPEN_ITERATIONS = 0
 PIECE_MASK_CLOSE_ITERATIONS = 0
-PIECE_USE_CLEAN_MASK_FOR_CONTOURS = False
+PIECE_USE_CLEAN_MASK_FOR_CONTOURS = False # 是否用清理后的 mask 找轮廓；False 可保留更多原始边缘细节。
+
+# 粘连碎片拆分参数；碎片贴在一起时可开启，但可能误拆单块。
 PIECE_SPLIT_TOUCHING_ENABLED = False
-PIECE_SPLIT_ERODE_KERNEL = (3, 3)
-PIECE_SPLIT_ERODE_ITERATIONS = 3
-PIECE_USE_CONVEX_HULL = True
-PIECE_APPROX_EPSILON_RATIO = 0.008
-PIECE_APPROX_EPSILON_STEP = 0.003
-PIECE_APPROX_EPSILON_MAX = 0.035
-PIECE_MIN_EDGE_LENGTH_RATIO = 0.025
-PIECE_REFINE_CORNERS_BY_LINES = True
-PIECE_LINE_FIT_TRIM_RATIO = 0.18
-PIECE_MAX_POINTS = 5
-PIECE_MAX_COUNT = 4
-PIECE_MIN_AREA_RATIO = 0.002
-PIECE_MAX_AREA_RATIO = 0.30
-PIECE_BORDER_MARGIN = 8
-PIECE_FRAME_MASK_MARGIN = 6
-PIECE_MIN_BBOX_SIDE = 8
-PIECE_MAX_ASPECT_RATIO = 8.0
-PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.30
+PIECE_SPLIT_ERODE_KERNEL = (3, 3)      # 腐蚀核大小，用于把粘连区域分开。
+PIECE_SPLIT_ERODE_ITERATIONS = 3       # 腐蚀次数，越大拆分越强，也越容易破坏形状。
 
-FIRST_Q_RECT_W_CM = 10.0
-FIRST_Q_RECT_H_CM = 6.0
-FIRST_Q_TARGET_SIDE = "auto"
-FIRST_Q_TARGET_ORIENTATION = "portrait"
-FIRST_Q_PLACE_MARGIN_CM = 0.0
-FIRST_Q_DIAG_A = [2.0, 0.0]
-FIRST_Q_DIAG_P = [3.6, 1.2]
-FIRST_Q_DIAG_Q = [7.6, 4.2]
-FIRST_Q_MATCH_SHAPE_WEIGHT = 1.0
-FIRST_Q_MATCH_AREA_WEIGHT = 4.0
-FIRST_Q_MATCH_POINT_WEIGHT = 0.08
-ROTATION_MATCH_SAMPLE_COUNT = 32
-ROTATION_MATCH_MAX_CANDIDATES = 12
+# 碎片轮廓拟合与过滤参数。
+PIECE_USE_CONVEX_HULL = True           # 是否先取凸包，减少轮廓凹坑/毛刺影响。
+PIECE_APPROX_EPSILON_RATIO = 0.008     # 多边形拟合初始精度比例，越小保留顶点越多。
+PIECE_APPROX_EPSILON_STEP = 0.003      # 拟合失败时逐步放宽的步长。
+PIECE_APPROX_EPSILON_MAX = 0.035       # 最大拟合精度比例，防止过度简化。
+PIECE_MIN_EDGE_LENGTH_RATIO = 0.025    # 最短边相对 A4 尺寸的比例，过滤毛刺短边。
+PIECE_REFINE_CORNERS_BY_LINES = True   # 是否用直线拟合交点细化角点位置。
+PIECE_LINE_FIT_TRIM_RATIO = 0.18       # 拟合边线时裁掉两端比例，减少角点附近噪声干扰。
+PIECE_MAX_POINTS = 5                   # 单个碎片最多角点数；第一题模板一般是 4 或 5 点。
+PIECE_MAX_COUNT = 4                    # 第一题最多识别 4 块碎片。
+PIECE_MIN_AREA_RATIO = 0.002           # 碎片最小面积占 A4 区域比例，过滤小噪声。
+PIECE_MAX_AREA_RATIO = 0.30            # 碎片最大面积占 A4 区域比例，过滤误检大块。
+PIECE_BORDER_MARGIN = 8                # 过滤贴近 A4 边框的干扰轮廓，单位像素。
+PIECE_FRAME_MASK_MARGIN = 6            # 生成整帧 mask 时保留的边缘安全距离。
+PIECE_MIN_BBOX_SIDE = 8                # 外接框最小边长，过滤极小轮廓。
+PIECE_MAX_ASPECT_RATIO = 8.0           # 外接框最大长宽比，过滤细长线状噪声。
+PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.3 # 拼好后的目标显示/匹配放大倍数。
 
+# 第一题目标矩形和摆放参数，单位厘米。
+FIRST_Q_RECT_W_CM = 10.0               # 目标矩形宽度。
+FIRST_Q_RECT_H_CM = 6.0                # 目标矩形高度。
+FIRST_Q_TARGET_SIDE = "auto"           # 目标区域放置侧；auto 表示程序自动选择。
+FIRST_Q_TARGET_ORIENTATION = "portrait"# 目标布局方向；portrait 表示竖向显示/输出。
+FIRST_Q_PLACE_MARGIN_CM = 0.0          # 目标放置外边距，单位厘米。
+
+# 第一题官方切割模板关键点，坐标原点是 10 cm x 6 cm 矩形左上角。
+FIRST_Q_DIAG_A = [2.0, 0.0]            # 模板中的 A 点，位于上边。
+FIRST_Q_DIAG_P = [3.6, 1.2]            # 模板中的内部连接点 P。
+FIRST_Q_DIAG_Q = [7.6, 4.2]            # 模板中的内部连接点 Q。
+FIRST_Q_MATCH_SHAPE_WEIGHT = 1.0       # 模板匹配中形状相似度权重。
+FIRST_Q_MATCH_AREA_WEIGHT = 4.0        # 模板匹配中面积比例权重。
+FIRST_Q_MATCH_POINT_WEIGHT = 0.08      # 模板匹配中角点距离权重。
+ROTATION_MATCH_SAMPLE_COUNT = 32       # 旋转匹配时采样多少个角度。
+ROTATION_MATCH_MAX_CANDIDATES = 12     # 每块碎片最多保留多少个旋转候选。
+
+# 第一题四块标准模板，单位厘米；A/B/C/D 是目标矩形被切开后的四块标准形状。
 FIRST_Q_TEMPLATES = [
     {"name": "A", "polygon_cm": [[0.0, 0.0], FIRST_Q_DIAG_A, FIRST_Q_DIAG_P, [0.0, 2.0]]},
     {"name": "B", "polygon_cm": [[0.0, 2.0], FIRST_Q_DIAG_P, FIRST_Q_DIAG_Q, [0.0, 3.0]]},
@@ -110,112 +134,45 @@ FIRST_Q_TEMPLATES = [
     {"name": "D", "polygon_cm": [FIRST_Q_DIAG_A, [10.0, 0.0], [10.0, 6.0], FIRST_Q_DIAG_Q, FIRST_Q_DIAG_P]},
 ]
 
-SECOND_Q_RECT_MIN_W_CM = 9.0
-SECOND_Q_RECT_MIN_H_CM = 5.0
-SECOND_Q_RECT_MAX_W_CM = 12.0
-SECOND_Q_RECT_MAX_H_CM = 9.0
-SECOND_Q_TARGET_SIDE = "auto"
-SECOND_Q_CENTERLINE_GAP_CM = 1.0
-SECOND_Q_MATCH_REL_TOLERANCE = 0.12
-# 窗口放宽以覆盖深 T(如 0.9 占比);惩罚保持平坦,深 T 同样是合法拓扑。
-SECOND_Q_PARTIAL_RATIO_MIN = 0.12
-SECOND_Q_PARTIAL_RATIO_MAX = 0.92
-SECOND_Q_COMPOSITE_EDGE_MAX_SPAN = 3
-SECOND_Q_COMPOSITE_EDGE_MIN_CHORD_RATIO = 0.96
-SECOND_Q_COMPOSITE_EDGE_MAX_DEVIATION_PX = 12.0
-SECOND_Q_SOLVE_PADDING_PX = 10
-SECOND_Q_DIMENSION_TOLERANCE_CM = 0.8
-SECOND_Q_MIN_RECT_FILL_RATIO = 0.45
-SECOND_Q_GOOD_RECT_FILL_RATIO = 0.88
-SECOND_Q_MAX_OVERLAP_RATIO = 0.12
-SECOND_Q_GOOD_OVERLAP_RATIO = 0.02
-SECOND_Q_RECT_APPROX_EPSILON_RATIO = 0.025
-SECOND_Q_FULL_MATCHES_PER_PAIR = 8
-# partial 不设过小截断:局部特征无法可靠地区分真假 T 匹配,真值靠评分函数裁决。
-SECOND_Q_PARTIAL_MATCHES_PER_PAIR = 22
-# 组合惩罚预算剪枝:超过该预算的组合不可能进入最终短名单。
-SECOND_Q_COMBO_PENALTY_BUDGET = 0.75
-# 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时。
-SECOND_Q_MAX_SCORED_COMBOS = 800
-SECOND_Q_MAX_SOLVE_COMBOS = 2500
-SECOND_Q_MAX_MATCHING_COMBO_CHECKS = 20000
-SECOND_Q_SOLVE_TIME_LIMIT_MS = 8000
-# 新拼接算法以光栅化掩膜评分为准(同参考实现);凸包近似评分对凹片/五边形会误判。
-SECOND_Q_USE_FAST_GEOMETRY_SCORE = False
-# Try a known topology first: auto/common/t_junction/corner/concave/equal_rectangles/branched_spine.
-# Use "all_reference" to scan the reference simulator's named modes.
-SECOND_Q_CUT_MODE = "branched_spine"
-SECOND_Q_REFERENCE_MATCHING = True
-SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v16"
-SECOND_Q_BOUNDARY_EDGE_WEIGHT = 80.0
-SECOND_Q_BOUNDARY_EDGE_MAX_ERROR_PX = 28.0
-SECOND_Q_BOUNDARY_COVER_DISTANCE_PX = 16.0
-SECOND_Q_BOUNDARY_COVER_PARALLEL_MIN = 0.92
-SECOND_Q_BOUNDARY_COVER_WEIGHT = 120.0
-SECOND_Q_RIGHT_ANGLE_MIN_DEG = 75.0
-SECOND_Q_RIGHT_ANGLE_MAX_DEG = 105.0
-SECOND_Q_RIGHT_CORNER_WEIGHT = 220.0
-SECOND_Q_RIGHT_CORNER_MISSING_PX = 80.0
-SECOND_Q_RIGHT_CORNER_MAX_ERROR_PX = 28.0
-SECOND_Q_RIGHT_CORNER_MIN_COUNT = 3
-SECOND_Q_RECT_FROM_RIGHT_CORNERS = True
-SECOND_Q_RECT_AREA_WEIGHT = 10.0
-SECOND_Q_USE_FIXED_RECT_SCORE = True
-SECOND_Q_FIXED_RECT_W_CM = FIRST_Q_RECT_W_CM
-SECOND_Q_FIXED_RECT_H_CM = FIRST_Q_RECT_H_CM
-SECOND_Q_FIXED_AREA_WEIGHT = 4.0
-SECOND_Q_FIXED_RECT_AREA_WEIGHT = 30.0
-SECOND_Q_FIXED_ASPECT_WEIGHT = 80000.0
-SECOND_Q_FIXED_PERIMETER_WEIGHT = 25.0
-SECOND_Q_BOUNDARY_REPAIR_REL_TOLERANCE = 0.12
-SECOND_Q_BOUNDARY_REPAIR_WEIGHT = 160.0
-SECOND_Q_DEBUG_TOP_N = 5
-SECOND_Q_DEBUG_CANDIDATES = True
-SECOND_Q_DEBUG_MAX_CAND_PRINT = 60
-SECOND_Q_SOLVE_PROGRESS_INTERVAL = 100
-SECOND_Q_DEBUG_SHORT_EDGE_PX = 20.0
-SECOND_Q_EDGE_CONTACT_MAX_ERROR_PX = 24.0
-SECOND_Q_EDGE_CONTACT_WEIGHT = 20.0
-SECOND_Q_HULL_GAP_WEIGHT = 80.0
-SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO = 0.08
-SECOND_Q_TWO_PIECE_MAX_OVERLAP_RATIO = 0.04
-SECOND_Q_STRICT_BOUNDARY_REJECT = False
-SECOND_Q_STRICT_EDGE_CONTACT_REJECT = False
+# A4 外框形状合理性限制。
+A4_RATIO_MIN = 1.25                    # A4 长宽比下限，防止非 A4 四边形误检。
+A4_RATIO_MAX = 1.65                    # A4 长宽比上限。
+ANGLE_MIN = 65.0                       # A4 四个角允许的最小角度，单位度。
+ANGLE_MAX = 115.0                      # A4 四个角允许的最大角度，单位度。
 
-A4_RATIO_MIN = 1.25
-A4_RATIO_MAX = 1.65
-ANGLE_MIN = 65.0
-ANGLE_MAX = 115.0
+# 打印、按键和性能调试参数。
+PRINT_INTERVAL_MS = 500                # 终端/串口打印最小间隔，单位毫秒。
+PRINT_MOVE_ONLY = True                 # 只在结果变化时打印，避免刷屏。
+SHOW_DEBUG_INFO = False                # 是否在画面叠加详细调试信息。
+ENABLE_KEY_EXIT = True                 # 是否允许按键退出程序。
+SEND_SERIAL_ON_KEY_PRESS = True        # 是否按键确认后才发送串口数据。
+PERF_PROFILE = True                    # 是否统计每帧处理耗时。
 
-PRINT_INTERVAL_MS = 500
-PRINT_MOVE_ONLY = True
-SHOW_DEBUG_INFO = False
-ENABLE_KEY_EXIT = True
-SEND_SERIAL_ON_KEY_PRESS = True
-PERF_PROFILE = True
-CAPTURE_FRAME_COUNT = 60
-CAPTURE_HOLD_MS = 65000
-CAPTURE_MIN_VALID_FRAMES = 2
-CAPTURE_OUTLIER_A4_CORNER_PX = 25.0
-CAPTURE_OUTLIER_CENTER_PX = 35.0
-CAPTURE_OUTLIER_ROTATE_DEG = 25.0
+# 稳定捕获参数；按键后连续采集多帧，剔除离群值后输出稳定结果。
+CAPTURE_FRAME_COUNT = 60               # 一次捕获最多处理帧数。
+CAPTURE_HOLD_MS = 65000                # 捕获最长等待时间，单位毫秒。
+CAPTURE_MIN_VALID_FRAMES = 2           # 至少需要多少帧有效识别结果。
+CAPTURE_OUTLIER_A4_CORNER_PX = 25.0    # A4 角点离群阈值，单位像素。
+CAPTURE_OUTLIER_CENTER_PX = 35.0       # 碎片中心离群阈值，单位像素。
+CAPTURE_OUTLIER_ROTATE_DEG = 25.0      # 旋转角离群阈值，单位度。
 
-SERIAL_OUTPUT_ENABLED = True
-SERIAL_PORT = "/dev/ttyS4"
-SERIAL_BAUDRATE = 115200
-SERIAL_OUTPUT_FORMAT = "binary"  # gcode, binary, text
-GCODE_FEEDRATE = 3000
-GCODE_TRAVEL_FEEDRATE = 5000
-GCODE_PEN_UP_Z = 5.0
-GCODE_PEN_DOWN_Z = 0.0
-GCODE_ROTATE_AXIS = "A"
+# 串口和 G-code 输出参数。
+SERIAL_OUTPUT_ENABLED = True           # 是否启用串口输出。
+SERIAL_PORT = "/dev/ttyS4"             # MaixCAM 上连接下位机的串口设备。
+SERIAL_BAUDRATE = 115200               # 串口波特率。
+SERIAL_OUTPUT_FORMAT = "binary"        # 输出格式：gcode、binary、text。
+GCODE_FEEDRATE = 3000                  # G-code 加工/下笔进给速度。
+GCODE_TRAVEL_FEEDRATE = 5000           # G-code 空走移动速度。
+GCODE_PEN_UP_Z = 5.0                   # G-code 抬笔高度。
+GCODE_PEN_DOWN_Z = 0.0                 # G-code 下笔高度。
+GCODE_ROTATE_AXIS = "A"                # G-code 中使用的旋转轴名称。
 
 # 机械坐标标定点，顺序是标准 A4 透视图里的 TL/TR/BR/BL。
 # 默认值表示以 A4 左上角为机械原点，单位 mm；实车标定时改成机械端实测坐标。
-MECH_COORD_OUTPUT_ENABLED = True
-MECH_SWAP_XY_FOR_STM32 = True
-MECH_COORD_DECIMALS = 0
-MECH_ROTATE_SCALE = 10.0
+MECH_COORD_OUTPUT_ENABLED = True       # 是否输出机械坐标。
+MECH_SWAP_XY_FOR_STM32 = True          # 是否交换 X/Y，适配 STM32 端坐标定义。
+MECH_COORD_DECIMALS = 0                # 机械坐标输出保留小数位数。
+MECH_ROTATE_SCALE = 10.0               # 旋转角缩放倍数，适配下位机协议。
 MECH_CALIBRATION_POINTS = [
     [0.0, 0.0],
     [A4_W_MM, 0.0],
@@ -231,6 +188,7 @@ DEBUG_SHOW_ORIGINAL_PROCESS = 1
 # 调试视图保留给现场排查，常规阶段 2 显示由 DISPLAY_MODE 控制。
 DEBUG_VIEW_MODE = 0
 
+# OpenCV 绘图颜色，顺序是 BGR，不是 RGB。
 GREEN = (0, 255, 0)
 RED = (0, 0, 255)
 YELLOW = (0, 255, 255)
@@ -239,11 +197,12 @@ BLACK = (0, 0, 0)
 BLUE = (255, 0, 0)
 CYAN = (255, 255, 0)
 
-capture_requested = False
-first_question_area_ratios_cache = None
-first_question_template_contour_cache = {}
-first_question_target_layout_cache = {}
-rotation_target_sample_cache = {}
+# 运行时状态和缓存，避免每帧重复计算固定模板。
+capture_requested = False                  # 是否已经请求一次稳定捕获。
+first_question_area_ratios_cache = None     # 第一题模板面积比例缓存。
+first_question_template_contour_cache = {}  # 第一题模板轮廓缓存。
+first_question_target_layout_cache = {}     # 第一题目标布局缓存。
+rotation_target_sample_cache = {}           # 旋转匹配采样点缓存。
 
 
 # =========================
@@ -543,8 +502,7 @@ def detect_pieces(frame, corners, matrix):
         if bbox_ratio > PIECE_MAX_ASPECT_RATIO:
             continue
 
-        use_convex_hull = PIECE_USE_CONVEX_HULL and not SECOND_QUESTION_MODE
-        boundary = cv2.convexHull(contour) if use_convex_hull else contour
+        boundary = cv2.convexHull(contour) if PIECE_USE_CONVEX_HULL else contour
         perimeter = cv2.arcLength(boundary, True)
         if perimeter <= 0:
             continue
@@ -600,9 +558,6 @@ def detect_pieces(frame, corners, matrix):
     if FIRST_QUESTION_MODE:
         assign_first_question_templates(pieces)
         attach_first_question_targets(pieces)
-    elif SECOND_QUESTION_MODE:
-        for piece_id, piece in enumerate(pieces):
-            piece["template"] = "P%d" % piece_id
 
     piece_debug = make_piece_debug(
         distance_map,
@@ -1425,1574 +1380,6 @@ def normalize_angle_180(angle):
     return angle
 
 
-def rigid_transform(angle_rad, tx, ty):
-    cosine = math.cos(float(angle_rad))
-    sine = math.sin(float(angle_rad))
-    return np.array(
-        [
-            [cosine, -sine, float(tx)],
-            [sine, cosine, float(ty)],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-
-
-def apply_homography_points(points, transform):
-    points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    ones = np.ones((len(points_array), 1), dtype=np.float32)
-    homogeneous = np.hstack((points_array, ones)).dot(np.asarray(transform, dtype=np.float32).T)
-    return homogeneous[:, :2] / np.maximum(1e-6, homogeneous[:, 2:3])
-
-
-def align_edge_transform(src_a, src_b, dst_a, dst_b):
-    source_vec = np.asarray(src_b, dtype=np.float32) - np.asarray(src_a, dtype=np.float32)
-    target_vec = np.asarray(dst_b, dtype=np.float32) - np.asarray(dst_a, dtype=np.float32)
-    angle = math.atan2(float(target_vec[1]), float(target_vec[0])) - math.atan2(float(source_vec[1]), float(source_vec[0]))
-    transform = rigid_transform(angle, 0.0, 0.0)
-    mapped = apply_homography_points(np.asarray([src_a], dtype=np.float32), transform)[0]
-    transform[:2, 2] = np.asarray(dst_a, dtype=np.float32) - mapped
-    return transform
-
-
-def second_question_target_origin(target_side=None, target_size=None):
-    target_side = target_side or SECOND_Q_TARGET_SIDE
-    if target_side == "auto":
-        target_side = "left"
-    if target_size is None:
-        rect_w = (SECOND_Q_RECT_MIN_W_CM + SECOND_Q_RECT_MAX_W_CM) * 0.5 * (WARP_W - 1) / A4_W_CM
-        rect_h = (SECOND_Q_RECT_MIN_H_CM + SECOND_Q_RECT_MAX_H_CM) * 0.5 * (WARP_H - 1) / A4_H_CM
-    else:
-        rect_w = float(target_size[0])
-        rect_h = float(target_size[1])
-    gap_px = SECOND_Q_CENTERLINE_GAP_CM * (WARP_W - 1) / A4_W_CM
-    center_x = WARP_W * 0.5
-    y = (WARP_H - rect_h) * 0.5
-    if target_side == "right":
-        x = center_x + gap_px
-    else:
-        x = center_x - gap_px - rect_w
-    x = max(0.0, min(float(x), WARP_W - rect_w - 1.0))
-    y = max(0.0, min(float(y), WARP_H - rect_h - 1.0))
-    return np.asarray([x, y], dtype=np.float32)
-
-
-def second_question_target_available_size(target_side=None):
-    target_side = target_side or SECOND_Q_TARGET_SIDE
-    if target_side == "auto":
-        target_side = "left"
-    gap_px = SECOND_Q_CENTERLINE_GAP_CM * (WARP_W - 1) / A4_W_CM
-    center_x = WARP_W * 0.5
-    if target_side == "right":
-        available_w = WARP_W - (center_x + gap_px) - 2.0
-    else:
-        available_w = center_x - gap_px - 2.0
-    return np.asarray(
-        [max(1.0, float(available_w)), max(1.0, float(WARP_H - 2.0))],
-        dtype=np.float32,
-    )
-
-
-def choose_second_question_target_side(pieces):
-    if SECOND_Q_TARGET_SIDE in ("left", "right"):
-        return SECOND_Q_TARGET_SIDE
-    centers = [piece.get("center") for piece in pieces if piece.get("center")]
-    if not centers:
-        return "left"
-    mean_x = float(np.mean([center[0] for center in centers]))
-    return "left" if mean_x >= WARP_W * 0.5 else "right"
-
-
-def second_question_target_rect(target_side=None, target_size=None):
-    origin = second_question_target_origin(target_side, target_size)
-    if target_size is None:
-        rect_w = (SECOND_Q_RECT_MIN_W_CM + SECOND_Q_RECT_MAX_W_CM) * 0.5 * (WARP_W - 1) / A4_W_CM
-        rect_h = (SECOND_Q_RECT_MIN_H_CM + SECOND_Q_RECT_MAX_H_CM) * 0.5 * (WARP_H - 1) / A4_H_CM
-    else:
-        rect_w = float(target_size[0])
-        rect_h = float(target_size[1])
-    return np.asarray(
-        [
-            origin,
-            origin + [rect_w, 0.0],
-            origin + [rect_w, rect_h],
-            origin + [0.0, rect_h],
-        ],
-        dtype=np.float32,
-    )
-
-
-def second_question_edge_components(edge_ref, point_count=None):
-    if isinstance(edge_ref, tuple):
-        start, span = edge_ref
-        return [int((start + offset) % point_count) for offset in range(int(span))]
-    return [int(edge_ref)]
-
-
-def second_question_edge_usage_intervals(edge_ref, point_count, start_t, end_t):
-    start_t = max(0.0, min(1.0, float(start_t)))
-    end_t = max(0.0, min(1.0, float(end_t)))
-    if end_t < start_t:
-        start_t, end_t = end_t, start_t
-    if isinstance(edge_ref, tuple):
-        return [
-            (int(component), 0.0, 1.0)
-            for component in second_question_edge_components(edge_ref, point_count)
-        ]
-    return [(int(edge_ref), start_t, end_t)]
-
-
-def second_question_interval_overlaps(a0, a1, b0, b1):
-    return max(float(a0), float(b0)) < min(float(a1), float(b1)) - 1e-4
-
-
-def second_question_can_claim_edge_intervals(used, piece_index, intervals):
-    for component, start_t, end_t in intervals:
-        for used_start, used_end in used.get((piece_index, component), []):
-            if second_question_interval_overlaps(start_t, end_t, used_start, used_end):
-                return False
-    return True
-
-
-def second_question_claim_edge_intervals(used, piece_index, intervals):
-    for component, start_t, end_t in intervals:
-        used.setdefault((piece_index, component), []).append((start_t, end_t))
-
-
-def second_question_edge_label(edge_ref):
-    if isinstance(edge_ref, tuple):
-        return "E%d+%d" % (int(edge_ref[0]), int(edge_ref[1]))
-    return "E%d" % int(edge_ref)
-
-
-def second_question_resolve_edge(points, edge_ref):
-    points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    if isinstance(edge_ref, tuple):
-        start, span = edge_ref
-        return points[int(start) % len(points)], points[(int(start) + int(span)) % len(points)]
-    return polygon_edges(points)[int(edge_ref)]
-
-
-def second_question_point_line_distance(point, line_start, line_end):
-    line_vec = line_end - line_start
-    line_len = float(np.linalg.norm(line_vec))
-    if line_len <= 1e-6:
-        return float(np.linalg.norm(point - line_start))
-    point_vec = point - line_start
-    cross = abs(float(line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0]))
-    return cross / line_len
-
-
-def second_question_piece_edge_refs(piece):
-    points = np.asarray(piece, dtype=np.float32).reshape(-1, 2)
-    count = len(points)
-    refs = []
-    for edge_index, edge in enumerate(polygon_edges(points)):
-        refs.append((edge_index, edge))
-
-    max_span = min(int(SECOND_Q_COMPOSITE_EDGE_MAX_SPAN), max(1, count - 1))
-    for span in range(2, max_span + 1):
-        for start in range(count):
-            end = (start + span) % count
-            chord_start = points[start]
-            chord_end = points[end]
-            chord_len = float(np.linalg.norm(chord_end - chord_start))
-            path_len = 0.0
-            max_deviation = 0.0
-            for offset in range(span):
-                edge_start = points[(start + offset) % count]
-                edge_end = points[(start + offset + 1) % count]
-                path_len += float(np.linalg.norm(edge_end - edge_start))
-                if 0 < offset < span:
-                    mid_point = points[(start + offset) % count]
-                    max_deviation = max(
-                        max_deviation,
-                        second_question_point_line_distance(mid_point, chord_start, chord_end),
-                    )
-            if chord_len <= 1e-6 or path_len <= 1e-6:
-                continue
-            if chord_len / path_len < SECOND_Q_COMPOSITE_EDGE_MIN_CHORD_RATIO:
-                continue
-            if max_deviation > SECOND_Q_COMPOSITE_EDGE_MAX_DEVIATION_PX:
-                continue
-            refs.append(((start, span), (chord_start, chord_end)))
-    return refs
-
-
-def second_question_polygon_angles(polygon):
-    """每个顶点的内角(弧度),对凹顶点(reflex)同样正确。"""
-    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
-    count = len(points)
-    # 手写有符号面积:MaixPy 的 cv2.contourArea 不一定支持 oriented 参数。
-    x = points[:, 0]
-    y = points[:, 1]
-    signed = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-    orientation = 1.0 if signed >= 0 else -1.0
-    angles = []
-    for index in range(count):
-        edge_prev = points[index] - points[index - 1]
-        edge_next = points[(index + 1) % count] - points[index]
-        turn = math.atan2(
-            float(edge_prev[0] * edge_next[1] - edge_prev[1] * edge_next[0]),
-            float(edge_prev[0] * edge_next[0] + edge_prev[1] * edge_next[1]),
-        )
-        angle = math.pi - orientation * turn
-        if angle <= 0:
-            angle += 2 * math.pi
-        elif angle > 2 * math.pi:
-            angle -= 2 * math.pi
-        angles.append(angle)
-    return np.asarray(angles, dtype=float)
-
-
-def second_question_endpoint_angle_bad(angle_sum, tolerance=math.radians(12.0)):
-    """端点处两片凸片内角和落在 (102°,168°):物理上不能是边界(90/180°)
-    也不能是三岔节点(>180°),只可能是四岔节点 —— 作为可疑信号累计。"""
-    return math.pi / 2 + tolerance < angle_sum < math.pi - tolerance
-
-
-def second_question_edge_endpoint_vertices(edge_ref, point_count):
-    """返回边的(起点顶点索引, 终点顶点索引),复合边取弦的两端。"""
-    if isinstance(edge_ref, tuple):
-        start, span = edge_ref
-        return int(start) % point_count, (int(start) + int(span)) % point_count
-    return int(edge_ref) % point_count, (int(edge_ref) + 1) % point_count
-
-
-def second_question_candidate_matchings(pieces):
-    all_edges = {}
-    for piece_index, piece in enumerate(pieces):
-        for edge_ref, edge in second_question_piece_edge_refs(piece):
-            all_edges[(piece_index, edge_ref)] = edge
-
-    vertex_angles = [second_question_polygon_angles(piece) for piece in pieces]
-    convex = [
-        bool(np.all(angles <= math.pi + math.radians(8.0)))
-        for angles in vertex_angles
-    ]
-    edge_lengths = {
-        key: float(np.linalg.norm(value[1] - value[0]))
-        for key, value in all_edges.items()
-    }
-
-    candidates = []
-    for (piece_i, edge_i), (piece_j, edge_j) in itertools.combinations(all_edges, 2):
-        if piece_i == piece_j:
-            continue
-        len_a = edge_lengths[(piece_i, edge_i)]
-        len_b = edge_lengths[(piece_j, edge_j)]
-        if len_a <= 1e-6 or len_b <= 1e-6:
-            continue
-        rel = abs(len_a - len_b) / max(len_a, len_b)
-        both_convex = convex[piece_i] and convex[piece_j]
-        count_i = len(pieces[piece_i])
-        count_j = len(pieces[piece_j])
-        start_i, end_i = second_question_edge_endpoint_vertices(edge_i, count_i)
-        start_j, end_j = second_question_edge_endpoint_vertices(edge_j, count_j)
-
-        def bad_ends(*pairs):
-            # 角度互补仅作排序软惩罚:(102°,168°) 的和也可能是合法的三片
-            # 边界节点/四岔内部节点,绝不能硬过滤,由评分函数最终裁决。
-            if not both_convex:
-                return 0
-            return sum(
-                second_question_endpoint_angle_bad(
-                    vertex_angles[ii][kk % len(vertex_angles[ii])]
-                    + vertex_angles[jj][ll % len(vertex_angles[jj])]
-                )
-                for ii, kk, jj, ll in pairs
-            )
-
-        # 反向对接:j 边起点 c ↔ i 边终点 b,j 边终点 d ↔ i 边起点 a
-        if rel < SECOND_Q_MATCH_REL_TOLERANCE:
-            bad = bad_ends(
-                (piece_i, end_i, piece_j, start_j),
-                (piece_i, start_i, piece_j, end_j),
-            )
-            candidates.append((rel + 0.02 * bad, piece_i, edge_i, piece_j, edge_j, 0.0, 1.0, 0.0, 1.0))
-
-        def partial_penalty(ii, kk, jj, ll):
-            # partial 的顶点-顶点接触端:真实 T 节点该端在两片外边界上,
-            # 内角和 ≈180°(或 90° 卡角);偏离越多越可疑(连续,上限 0.1)。
-            if not both_convex:
-                return 0.15
-            angle_sum = (
-                vertex_angles[ii][kk % len(vertex_angles[ii])]
-                + vertex_angles[jj][ll % len(vertex_angles[jj])]
-            )
-            if angle_sum >= math.pi - math.radians(12.0):
-                dev = abs(math.pi - angle_sum)  # 略超 180° 同样收小惩罚
-            else:
-                dev = min(abs(angle_sum - math.pi), abs(angle_sum - math.pi / 2))
-                dev = max(0.0, dev - math.radians(12.0))
-            return 0.15 + min(0.10, 0.005 * math.degrees(dev))
-
-        ratio = min(len_a, len_b) / max(len_a, len_b)
-        if SECOND_Q_PARTIAL_RATIO_MIN <= ratio <= SECOND_Q_PARTIAL_RATIO_MAX:
-            # T 节点:短边整条占据长边的 [0,ratio] 或 [1-ratio,1]。
-            if len_a > len_b:
-                # j 整条边占据 i 边的 [0,ratio](边界端 a↔d)或 [1-ratio,1](b↔c)
-                candidates.append((
-                    partial_penalty(piece_i, start_i, piece_j, end_j)
-                    + 0.02 * bad_ends((piece_i, start_i, piece_j, end_j)),
-                    piece_i, edge_i, piece_j, edge_j, 0.0, ratio, 0.0, 1.0,
-                ))
-                candidates.append((
-                    partial_penalty(piece_i, end_i, piece_j, start_j)
-                    + 0.02 * bad_ends((piece_i, end_i, piece_j, start_j)),
-                    piece_i, edge_i, piece_j, edge_j, 1.0 - ratio, 1.0, 0.0, 1.0,
-                ))
-            else:
-                candidates.append((
-                    partial_penalty(piece_i, end_i, piece_j, start_j)
-                    + 0.02 * bad_ends((piece_i, end_i, piece_j, start_j)),
-                    piece_i, edge_i, piece_j, edge_j, 0.0, 1.0, 0.0, ratio,
-                ))
-                candidates.append((
-                    partial_penalty(piece_i, start_i, piece_j, end_j)
-                    + 0.02 * bad_ends((piece_i, start_i, piece_j, end_j)),
-                    piece_i, edge_i, piece_j, edge_j, 0.0, 1.0, 1.0 - ratio, 1.0,
-                ))
-
-    # 多段部分边匹配(双T/多T切割):一条长边可能被两条短边分段共享
-    for (piece_i, edge_i), _edge in all_edges.items():
-        len_a = edge_lengths[(piece_i, edge_i)]
-        if len_a <= 1e-6:
-            continue
-        short_edges = []
-        for (piece_j, edge_j), _other in all_edges.items():
-            if piece_i == piece_j:
-                continue
-            len_b = edge_lengths[(piece_j, edge_j)]
-            ratio = len_b / len_a
-            # 短边长度应该在长边的 10% ~ 90% 之间
-            if 0.10 <= ratio <= 0.90:
-                short_edges.append((piece_j, edge_j, len_b))
-        if len(short_edges) < 2:
-            continue
-        for (piece_j1, edge_j1, len_b1), (piece_j2, edge_j2, len_b2) in itertools.combinations(short_edges, 2):
-            total_short = len_b1 + len_b2
-            length_rel = abs(total_short - len_a) / len_a
-            if length_rel > 0.15:  # 15% 容差
-                continue
-            # 分割点:短边1占 [0, len_b1/len_a],短边2占 [len_b1/len_a, 1]
-            split = len_b1 / len_a
-            candidates.append((
-                0.15 + length_rel,
-                piece_i, edge_i, piece_j1, edge_j1, 0.0, split, 0.0, 1.0,
-            ))
-            candidates.append((
-                0.15 + length_rel,
-                piece_i, edge_i, piece_j2, edge_j2, split, 1.0, 0.0, 1.0,
-            ))
-
-    # edge_ref 可能是复合边元组,不能直接按元组比较,一律按惩罚排序。
-    candidates.sort(key=lambda item: item[0])
-    # Preserve ambiguity *per pair of pieces*. A global top-N shortlist is
-    # biased toward repeated outer-card lengths (especially rectangular or
-    # near-symmetric fragments) and can discard the only true cut edge for
-    # another pair. That leaves the global scorer no correct topology to
-    # choose from, regardless of how strongly overlap is penalized.
-    grouped = {}
-    for candidate in candidates:
-        pair = tuple(sorted((candidate[1], candidate[3])))
-        grouped.setdefault(pair, []).append(candidate)
-
-    shortlist = []
-    for group in grouped.values():
-        full = [candidate for candidate in group if tuple(candidate[5:]) == (0.0, 1.0, 0.0, 1.0)]
-        partial = [candidate for candidate in group if tuple(candidate[5:]) != (0.0, 1.0, 0.0, 1.0)]
-        shortlist.extend(full[:SECOND_Q_FULL_MATCHES_PER_PAIR])
-        shortlist.extend(partial[:SECOND_Q_PARTIAL_MATCHES_PER_PAIR])
-    shortlist.sort(key=lambda item: item[0])
-    return shortlist
-
-
-def second_question_match_segments(pieces, match):
-    _, piece_i, edge_i, piece_j, edge_j, ia0, ia1, ja0, ja1 = match
-    a, b = second_question_resolve_edge(pieces[piece_i], edge_i)
-    c, d = second_question_resolve_edge(pieces[piece_j], edge_j)
-    return (
-        a + (b - a) * ia0,
-        a + (b - a) * ia1,
-        c + (d - c) * ja0,
-        c + (d - c) * ja1,
-    )
-
-
-def second_question_matching_sets(pieces, candidates=None, cut_mode="auto", max_scored=SECOND_Q_MAX_SCORED_COMBOS):
-    """按碎片对拓扑枚举匹配组合:full/partial 任意混合,|E| = N-1 或 N。
-
-    邻接对偶图可以是树(N-1)或带一个环(N,如共顶点族/双T链),环上的
-    closure_error 由评分函数裁决,不再在组合阶段按 cut_mode 硬编码结构。
-    按"碎片对拓扑"枚举 + 边区间冲突提前剪枝 + 惩罚预算剪枝,避免在全
-    候选集上做组合爆炸。
-    """
-    count = len(pieces)
-    if count == 1:
-        yield ()
-        return
-    if candidates is None:
-        candidates = second_question_candidate_matchings(pieces)
-    by_pair = {}
-    for match in candidates:
-        by_pair.setdefault((match[1], match[3]), []).append(match)
-    # 预计算每个候选的边区间占用,避免递归内重复调用辅助函数(枚举是耗时大头)
-    claims_cache = {}
-    for match in candidates:
-        _, piece_i, edge_i, piece_j, edge_j, ia0, ia1, ja0, ja1 = match
-        claims = [
-            (piece_i, component, start_t, end_t)
-            for component, start_t, end_t in second_question_edge_usage_intervals(
-                edge_i, len(pieces[piece_i]), ia0, ia1)
-        ]
-        claims += [
-            (piece_j, component, start_t, end_t)
-            for component, start_t, end_t in second_question_edge_usage_intervals(
-                edge_j, len(pieces[piece_j]), ja0, ja1)
-        ]
-        claims_cache[match] = claims
-    pair_list = sorted(by_pair)
-    valid = []
-
-    def connected(topo):
-        degree = [0] * count
-        graph = [set() for _ in range(count)]
-        for piece_i, piece_j in topo:
-            degree[piece_i] += 1
-            degree[piece_j] += 1
-            graph[piece_i].add(piece_j)
-            graph[piece_j].add(piece_i)
-        if any(item == 0 for item in degree):
-            return False
-        seen, stack = {0}, [0]
-        while stack:
-            for neighbor in graph[stack.pop()]:
-                if neighbor not in seen:
-                    seen.add(neighbor)
-                    stack.append(neighbor)
-        return len(seen) == count
-
-    for size in (count - 1, count):
-        if size < 1 or size > len(pair_list):
-            continue
-        for topo in itertools.combinations(pair_list, size):
-            if not connected(topo):
-                continue
-            chosen = []
-            used = {}
-
-            def rec(index, penalty):
-                if index == len(topo):
-                    valid.append((penalty, tuple(chosen)))
-                    return
-                # 惩罚预算剪枝:超过预算的组合不可能进入最终短名单
-                for match in by_pair[topo[index]]:
-                    new_penalty = penalty + float(match[0])
-                    if new_penalty > SECOND_Q_COMBO_PENALTY_BUDGET:
-                        break  # 每对候选按惩罚升序,后续更贵
-                    claims = claims_cache[match]
-                    conflict = False
-                    for piece_index, component, start_t, end_t in claims:
-                        for used_start, used_end in used.get((piece_index, component), ()):
-                            if max(start_t, used_start) < min(end_t, used_end) - 1e-4:
-                                conflict = True
-                                break
-                        if conflict:
-                            break
-                    if conflict:
-                        continue
-                    for piece_index, component, start_t, end_t in claims:
-                        used.setdefault((piece_index, component), []).append((start_t, end_t))
-                    chosen.append(match)
-                    rec(index + 1, new_penalty)
-                    chosen.pop()
-                    for piece_index, component, _start_t, _end_t in claims:
-                        bucket = used[(piece_index, component)]
-                        bucket.pop()
-                        if not bucket:
-                            del used[(piece_index, component)]
-
-            rec(0, 0.0)
-    # 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时
-    valid.sort(key=lambda item: item[0])
-    for _penalty, combo in valid[:max_scored]:
-        yield combo
-
-
-
-def second_question_reject(reject_stats, reason):
-    if reject_stats is not None:
-        reject_stats[reason] = reject_stats.get(reason, 0) + 1
-    return None
-
-
-def second_question_format_reject_stats(reject_stats):
-    if not reject_stats:
-        return "none"
-    return ",".join("%s=%d" % (key, reject_stats[key]) for key in sorted(reject_stats))
-
-
-def second_question_assemble_from_matches(pieces, matches, reject_stats=None):
-    adjacency = [[] for _ in pieces]
-    for match in matches:
-        _, piece_i, _edge_i, piece_j, _edge_j = match[:5]
-        adjacency[piece_i].append((piece_j, match, False))
-        adjacency[piece_j].append((piece_i, match, True))
-
-    transforms = [None] * len(pieces)
-    transforms[0] = np.eye(3, dtype=np.float32)
-    stack = [0]
-    closure_error = 0.0
-    while stack:
-        piece_i = stack.pop()
-        for piece_j, match, reversed_sides in adjacency[piece_i]:
-            ia, ib, ja, jb = second_question_match_segments(pieces, match)
-            if reversed_sides:
-                ia, ib, ja, jb = ja, jb, ia, ib
-            world_a, world_b = apply_homography_points(np.asarray([ia, ib], dtype=np.float32), transforms[piece_i])
-            proposed = align_edge_transform(ja, jb, world_b, world_a)
-            if transforms[piece_j] is None:
-                transforms[piece_j] = proposed
-                stack.append(piece_j)
-            else:
-                previous = apply_homography_points(pieces[piece_j], transforms[piece_j])
-                current = apply_homography_points(pieces[piece_j], proposed)
-                closure_error += float(np.linalg.norm(current - previous, axis=1).mean())
-
-    if any(transform is None for transform in transforms):
-        return second_question_reject(reject_stats, "disconnected")
-    assembled = [apply_homography_points(piece, transform) for piece, transform in zip(pieces, transforms)]
-    return second_question_score_assembly(transforms, assembled, matches, closure_error, reject_stats)
-
-
-def second_question_boundary_edge_error(assembled, rect, matches):
-    rect_points = order_points(cv2.boxPoints(rect))
-    rect_sides = polygon_edges(rect_points)
-    matched_edges = set()
-    for match in matches:
-        _, piece_i, edge_i, piece_j, edge_j = match[:5]
-        for component in second_question_edge_components(edge_i, len(assembled[piece_i])):
-            matched_edges.add((piece_i, component))
-        for component in second_question_edge_components(edge_j, len(assembled[piece_j])):
-            matched_edges.add((piece_j, component))
-    total_error = 0.0
-    max_piece_error = 0.0
-    for piece_index, polygon in enumerate(assembled):
-        best_error = None
-        for edge_index, (edge_start, edge_end) in enumerate(polygon_edges(polygon)):
-            if (piece_index, edge_index) in matched_edges:
-                continue
-            edge_vec = edge_end - edge_start
-            edge_len = float(np.linalg.norm(edge_vec))
-            if edge_len <= 1e-6:
-                continue
-            edge_unit = edge_vec / edge_len
-            for side_start, side_end in rect_sides:
-                side_vec = side_end - side_start
-                side_len = float(np.linalg.norm(side_vec))
-                if side_len <= 1e-6:
-                    continue
-                side_unit = side_vec / side_len
-                parallel_error = 1.0 - abs(float(np.dot(edge_unit, side_unit)))
-                start_error = point_rect_side_distance(edge_start, side_start, side_end)
-                end_error = point_rect_side_distance(edge_end, side_start, side_end)
-                error = (start_error + end_error) * 0.5 + parallel_error * side_len * 0.4
-                if best_error is None or error < best_error:
-                    best_error = error
-        if best_error is None:
-            best_error = 999.0
-        max_piece_error = max(max_piece_error, best_error)
-        total_error += best_error * best_error
-    return total_error, max_piece_error
-
-
-def merge_intervals(intervals):
-    if not intervals:
-        return []
-    intervals = sorted((max(0.0, float(start)), min(1.0, float(end))) for start, end in intervals)
-    merged = []
-    for start, end in intervals:
-        if end <= start:
-            continue
-        if not merged or start > merged[-1][1]:
-            merged.append([start, end])
-        else:
-            merged[-1][1] = max(merged[-1][1], end)
-    return merged
-
-
-def second_question_matched_edge_components(assembled, matches):
-    matched_edges = set()
-    for match in matches:
-        _, piece_i, edge_i, piece_j, edge_j = match[:5]
-        for component in second_question_edge_components(edge_i, len(assembled[piece_i])):
-            matched_edges.add((piece_i, component))
-        for component in second_question_edge_components(edge_j, len(assembled[piece_j])):
-            matched_edges.add((piece_j, component))
-    return matched_edges
-
-
-def second_question_boundary_cover_intervals(assembled, rect, matches):
-    rect_points = order_points(cv2.boxPoints(rect))
-    rect_sides = polygon_edges(rect_points)
-    matched_edges = second_question_matched_edge_components(assembled, matches)
-    side_intervals = [[] for _ in rect_sides]
-    for piece_index, polygon in enumerate(assembled):
-        for edge_index, (edge_start, edge_end) in enumerate(polygon_edges(polygon)):
-            if (piece_index, edge_index) in matched_edges:
-                continue
-            edge_vec = edge_end - edge_start
-            edge_len = float(np.linalg.norm(edge_vec))
-            if edge_len <= 1e-6:
-                continue
-            edge_unit = edge_vec / edge_len
-            edge_mid = (edge_start + edge_end) * 0.5
-            for side_index, (side_start, side_end) in enumerate(rect_sides):
-                side_vec = side_end - side_start
-                side_len_sq = float(np.dot(side_vec, side_vec))
-                side_len = math.sqrt(max(1e-6, side_len_sq))
-                side_unit = side_vec / side_len
-                if abs(float(np.dot(edge_unit, side_unit))) < SECOND_Q_BOUNDARY_COVER_PARALLEL_MIN:
-                    continue
-                distances = (
-                    point_rect_side_distance(edge_start, side_start, side_end),
-                    point_rect_side_distance(edge_mid, side_start, side_end),
-                    point_rect_side_distance(edge_end, side_start, side_end),
-                )
-                if max(distances) > SECOND_Q_BOUNDARY_COVER_DISTANCE_PX:
-                    continue
-                t0 = float(np.dot(edge_start - side_start, side_vec) / side_len_sq)
-                t1 = float(np.dot(edge_end - side_start, side_vec) / side_len_sq)
-                side_intervals[side_index].append((min(t0, t1), max(t0, t1)))
-    return rect_sides, side_intervals
-
-
-def second_question_boundary_coverage_error(assembled, rect, matches):
-    rect_sides, side_intervals = second_question_boundary_cover_intervals(assembled, rect, matches)
-    total_error = 0.0
-    max_missing_ratio = 0.0
-    for intervals, (side_start, side_end) in zip(side_intervals, rect_sides):
-        covered = sum(end - start for start, end in merge_intervals(intervals))
-        missing_ratio = max(0.0, 1.0 - covered)
-        side_len = float(np.linalg.norm(side_end - side_start))
-        total_error += (missing_ratio * side_len) ** 2
-        max_missing_ratio = max(max_missing_ratio, missing_ratio)
-    return total_error, max_missing_ratio
-
-
-def complement_intervals(intervals):
-    merged = merge_intervals(intervals)
-    result = []
-    cursor = 0.0
-    for start, end in merged:
-        if start > cursor:
-            result.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < 1.0:
-        result.append((cursor, 1.0))
-    return result
-
-
-def second_question_boundary_repair_error(assembled, rect, matches):
-    rect_sides, side_intervals = second_question_boundary_cover_intervals(assembled, rect, matches)
-    matched_edges = second_question_matched_edge_components(assembled, matches)
-    candidate_edges = []
-    for piece_index, polygon in enumerate(assembled):
-        for edge_index, (edge_start, edge_end) in enumerate(polygon_edges(polygon)):
-            if (piece_index, edge_index) in matched_edges:
-                continue
-            edge_vec = edge_end - edge_start
-            edge_len = float(np.linalg.norm(edge_vec))
-            if edge_len <= 1e-6:
-                continue
-            candidate_edges.append((piece_index, edge_index, edge_start, edge_end, edge_vec / edge_len, edge_len))
-
-    total_error = 0.0
-    max_repairable_gap = 0.0
-    repairable_count = 0
-    for side_index, (side_start, side_end) in enumerate(rect_sides):
-        side_vec = side_end - side_start
-        side_len = float(np.linalg.norm(side_vec))
-        if side_len <= 1e-6:
-            continue
-        side_unit = side_vec / side_len
-        for start_t, end_t in complement_intervals(side_intervals[side_index]):
-            gap_len = (end_t - start_t) * side_len
-            if gap_len <= 1e-6:
-                continue
-            best_error = None
-            for _piece_index, _edge_index, _edge_start, _edge_end, edge_unit, edge_len in candidate_edges:
-                rel = abs(edge_len - gap_len) / max(edge_len, gap_len)
-                if rel > SECOND_Q_BOUNDARY_REPAIR_REL_TOLERANCE:
-                    continue
-                # abs(dot) accepts both direct alignment and a 180-degree flipped placement.
-                parallel = abs(float(np.dot(edge_unit, side_unit)))
-                if parallel < SECOND_Q_BOUNDARY_COVER_PARALLEL_MIN:
-                    continue
-                error = rel * gap_len + (1.0 - parallel) * gap_len
-                if best_error is None or error < best_error:
-                    best_error = error
-            if best_error is not None:
-                repairable_count += 1
-                max_repairable_gap = max(max_repairable_gap, gap_len)
-                total_error += gap_len * gap_len + best_error * best_error
-    return total_error, max_repairable_gap, repairable_count
-
-
-def point_rect_side_distance(point, side_start, side_end):
-    point = np.asarray(point, dtype=np.float32)
-    side_start = np.asarray(side_start, dtype=np.float32)
-    side_end = np.asarray(side_end, dtype=np.float32)
-    side_vec = side_end - side_start
-    side_len_sq = float(np.dot(side_vec, side_vec))
-    if side_len_sq <= 1e-6:
-        return float(np.linalg.norm(point - side_start))
-    t = float(np.dot(point - side_start, side_vec) / side_len_sq)
-    projection = side_start + side_vec * t
-    line_distance = float(np.linalg.norm(point - projection))
-    if t < 0.0:
-        return float(np.linalg.norm(point - side_start))
-    if t > 1.0:
-        return float(np.linalg.norm(point - side_end))
-    return line_distance
-
-
-def second_question_edge_contact_error(assembled, rect, matches):
-    rect_points = order_points(cv2.boxPoints(rect))
-    rect_sides = polygon_edges(rect_points)
-    internal_segments = []
-    for match in matches:
-        _, piece_i, edge_i, piece_j, edge_j, ia0, ia1, ja0, ja1 = match
-        edge_i_start, edge_i_end = second_question_resolve_edge(assembled[piece_i], edge_i)
-        edge_j_start, edge_j_end = second_question_resolve_edge(assembled[piece_j], edge_j)
-        internal_segments.append((
-            piece_i,
-            set(second_question_edge_components(edge_i, len(assembled[piece_i]))),
-            edge_i_start + (edge_i_end - edge_i_start) * ia0,
-            edge_i_start + (edge_i_end - edge_i_start) * ia1,
-        ))
-        internal_segments.append((
-            piece_j,
-            set(second_question_edge_components(edge_j, len(assembled[piece_j]))),
-            edge_j_start + (edge_j_end - edge_j_start) * ja0,
-            edge_j_start + (edge_j_end - edge_j_start) * ja1,
-        ))
-
-    total_error = 0.0
-    max_error = 0.0
-    sample_positions = (0.25, 0.5, 0.75)
-    for piece_index, polygon in enumerate(assembled):
-        for edge_index, (edge_start, edge_end) in enumerate(polygon_edges(polygon)):
-            for position in sample_positions:
-                sample = edge_start + (edge_end - edge_start) * position
-                best_distance = None
-                for side_start, side_end in rect_sides:
-                    dist = point_rect_side_distance(sample, side_start, side_end)
-                    if best_distance is None or dist < best_distance:
-                        best_distance = dist
-                for owner_piece, owner_edges, seg_start, seg_end in internal_segments:
-                    if owner_piece == piece_index and edge_index in owner_edges:
-                        continue
-                    dist = point_rect_side_distance(sample, seg_start, seg_end)
-                    if best_distance is None or dist < best_distance:
-                        best_distance = dist
-                if best_distance is None:
-                    best_distance = 999.0
-                max_error = max(max_error, best_distance)
-                total_error += best_distance * best_distance
-    return total_error, max_error
-
-
-def second_question_optimize_pose_graph(pieces, matches, initial):
-    if len(pieces) < 3:
-        return initial
-
-    def pack(poses):
-        values = []
-        for transform in poses[1:]:
-            values.extend([
-                math.atan2(float(transform[1, 0]), float(transform[0, 0])),
-                float(transform[0, 2]),
-                float(transform[1, 2]),
-            ])
-        return np.asarray(values, dtype=float)
-
-    def unpack(values):
-        poses = [initial[0]]
-        for index in range(len(pieces) - 1):
-            theta, tx, ty = values[index * 3:index * 3 + 3]
-            poses.append(rigid_transform(theta, tx, ty))
-        return poses
-
-    def residual(values):
-        poses = unpack(values)
-        result = []
-        for match in matches:
-            _, piece_i, _edge_i, piece_j, _edge_j = match[:5]
-            ia, ib, ja, jb = second_question_match_segments(pieces, match)
-            world_i = apply_homography_points(np.asarray([ia, ib], dtype=np.float32), poses[piece_i])
-            world_j = apply_homography_points(np.asarray([jb, ja], dtype=np.float32), poses[piece_j])
-            result.extend((world_i - world_j).ravel())
-        return np.asarray(result, dtype=float)
-
-    def cost(values):
-        return float(np.linalg.norm(residual(values)))
-
-    values = pack(initial)
-    lam = 1e-3  # LM 阻尼:步长过大自动增大,收敛顺利则减小
-    best_values, best_cost = values.copy(), cost(values)
-    for _ in range(30):
-        base_residual = residual(values)
-        base_norm = float(np.linalg.norm(base_residual))
-        if base_norm < 1e-9:
-            break
-        jacobian = np.empty((len(base_residual), len(values)))
-        for index in range(len(values)):
-            step = 1e-5 if index % 3 == 0 else 1e-3
-            shifted = values.copy()
-            shifted[index] += step
-            jacobian[:, index] = (residual(shifted) - base_residual) / step
-        try:
-            delta = np.linalg.solve(
-                jacobian.T @ jacobian + lam * np.eye(len(values)),
-                -jacobian.T @ base_residual,
-            )
-        except np.linalg.LinAlgError:
-            break
-        candidate = values + delta
-        if cost(candidate) < base_norm:
-            values = candidate
-            lam = max(lam * 0.5, 1e-6)
-            if cost(candidate) < best_cost:
-                best_values, best_cost = values.copy(), cost(candidate)
-            if np.linalg.norm(delta) < 1e-7:
-                break
-        else:
-            lam *= 5.0  # 发散则回退并加大阻尼
-            if lam > 1e4:
-                break
-    if best_cost > cost(pack(initial)) + 1e-9:
-        return initial  # 优化结果不如初始解,回退防发散
-    return unpack(best_values)
-
-
-def second_question_pairwise_overlap_area(assembled):
-    overlap = 0.0
-    for polygon_a, polygon_b in itertools.combinations(assembled, 2):
-        contour_a = cv2.convexHull(np.asarray(polygon_a, dtype=np.float32).reshape(-1, 1, 2))
-        contour_b = cv2.convexHull(np.asarray(polygon_b, dtype=np.float32).reshape(-1, 1, 2))
-        try:
-            area, _intersection = cv2.intersectConvexConvex(contour_a, contour_b)
-            overlap += max(0.0, float(area))
-        except Exception:
-            pass
-    return overlap
-
-
-def second_question_fixed_rect_metrics():
-    rect_w_px = float(SECOND_Q_FIXED_RECT_W_CM) * (WARP_W - 1) / A4_W_CM
-    rect_h_px = float(SECOND_Q_FIXED_RECT_H_CM) * (WARP_H - 1) / A4_H_CM
-    area = max(1.0, rect_w_px * rect_h_px)
-    aspect = max(rect_w_px, rect_h_px) / max(1.0, min(rect_w_px, rect_h_px))
-    perimeter = 2.0 * (rect_w_px + rect_h_px)
-    return area, aspect, perimeter
-
-
-def polygon_internal_angle(prev_point, point, next_point):
-    v1 = np.asarray(prev_point, dtype=np.float32) - np.asarray(point, dtype=np.float32)
-    v2 = np.asarray(next_point, dtype=np.float32) - np.asarray(point, dtype=np.float32)
-    len1 = float(np.linalg.norm(v1))
-    len2 = float(np.linalg.norm(v2))
-    if len1 <= 1e-6 or len2 <= 1e-6:
-        return 180.0
-    cosine = max(-1.0, min(1.0, float(np.dot(v1, v2) / (len1 * len2))))
-    return math.degrees(math.acos(cosine))
-
-
-def second_question_right_angle_points(assembled):
-    points = []
-    for polygon in assembled:
-        polygon = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
-        count = len(polygon)
-        for index, point in enumerate(polygon):
-            angle = polygon_internal_angle(polygon[index - 1], point, polygon[(index + 1) % count])
-            if SECOND_Q_RIGHT_ANGLE_MIN_DEG <= angle <= SECOND_Q_RIGHT_ANGLE_MAX_DEG:
-                points.append(point)
-    return points
-
-
-def second_question_right_corner_error(assembled, rect):
-    rect_points = order_points(cv2.boxPoints(rect)).astype(np.float32)
-    right_points = second_question_right_angle_points(assembled)
-    if not right_points:
-        return (
-            float(len(rect_points)) * SECOND_Q_RIGHT_CORNER_MISSING_PX ** 2,
-            SECOND_Q_RIGHT_CORNER_MISSING_PX,
-            0,
-        )
-
-    used = set()
-    total_error = 0.0
-    max_error = 0.0
-    for corner in rect_points:
-        best_index = None
-        best_distance = None
-        for index, point in enumerate(right_points):
-            if index in used:
-                continue
-            distance = float(np.linalg.norm(np.asarray(point, dtype=np.float32) - corner))
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_index = index
-        if best_index is None:
-            best_distance = SECOND_Q_RIGHT_CORNER_MISSING_PX
-        else:
-            used.add(best_index)
-        total_error += best_distance * best_distance
-        max_error = max(max_error, best_distance)
-    return total_error, max_error, len(right_points)
-
-
-def second_question_score_assembly_fast(transforms, assembled, matches, closure_error, reject_stats=None):
-    all_points = np.vstack(assembled).astype(np.float32)
-    min_point = all_points.min(axis=0)
-    max_point = all_points.max(axis=0)
-    width, height = np.ceil(max_point - min_point + SECOND_Q_SOLVE_PADDING_PX * 2).astype(int)
-    if width <= 1 or height <= 1 or width > WARP_W * 3 or height > WARP_H * 3:
-        return second_question_reject(reject_stats, "bad_canvas")
-
-    rect = cv2.minAreaRect(all_points)
-    rect_w, rect_h = rect[1]
-    rect_area = float(rect_w * rect_h)
-    if rect_area <= 1e-6:
-        return second_question_reject(reject_stats, "bad_rect")
-
-    piece_area = sum(
-        abs(float(cv2.contourArea(np.asarray(polygon, dtype=np.float32))))
-        for polygon in assembled
-    )
-    piece_area = max(1.0, piece_area)
-    fixed_area, fixed_aspect, fixed_perimeter = second_question_fixed_rect_metrics()
-    expected_area = fixed_area if SECOND_Q_USE_FIXED_RECT_SCORE else piece_area
-    overlap = second_question_pairwise_overlap_area(assembled)
-    union_area = max(1.0, piece_area - overlap)
-    fill_error = max(0.0, rect_area - union_area)
-    area_gap = max(0.0, rect_area - expected_area)
-    area_gap_ratio = area_gap / expected_area
-    aspect = max(float(rect_w), float(rect_h)) / max(1.0, min(float(rect_w), float(rect_h)))
-    aspect_error = abs(math.log(max(aspect, 1e-6) / max(fixed_aspect, 1e-6))) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
-    hull = cv2.convexHull(all_points.reshape(-1, 1, 2))
-    hull_area = max(1.0, float(cv2.contourArea(hull)))
-    perimeter = float(cv2.arcLength(hull, True))
-    perimeter_error = abs(perimeter - fixed_perimeter) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
-    hull_gap = max(0.0, hull_area - expected_area)
-    hull_gap_ratio = hull_gap / expected_area
-    overlap_ratio = overlap / union_area
-    if len(assembled) == 2 and overlap_ratio > SECOND_Q_TWO_PIECE_MAX_OVERLAP_RATIO:
-        return second_question_reject(reject_stats, "overlap")
-    if len(assembled) == 2 and hull_gap_ratio > SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO:
-        return second_question_reject(reject_stats, "hull")
-
-    # 评分项与参考实现(puzzle_sim.assemble_from_matches)对齐:
-    # 闭环/重叠/填充/面积/长宽比/周长/匹配惩罚。旧版 boundary/right_corner/
-    # edge_contact 附加项会误杀 T 节点与凹片的正确解,已从评分与拒绝中移除。
-    match_error = sum(float(match[0]) for match in matches) * 3000.0
-    score = (
-        closure_error * 400.0
-        + overlap * 12.0
-        + fill_error * 8.0
-        + abs(union_area - expected_area) * (SECOND_Q_FIXED_AREA_WEIGHT if SECOND_Q_USE_FIXED_RECT_SCORE else 4.0)
-        + abs(rect_area - expected_area) * 3.0
-        + aspect_error * SECOND_Q_FIXED_ASPECT_WEIGHT
-        + perimeter_error * SECOND_Q_FIXED_PERIMETER_WEIGHT
-        + match_error
-    )
-    detail = {
-        "overlap": overlap,
-        "fill": union_area / rect_area,
-        "aspect": aspect,
-        "area_gap": area_gap,
-        "area_gap_ratio": area_gap_ratio,
-        "hull_gap": hull_gap,
-        "hull_gap_ratio": hull_gap_ratio,
-        "boundary": 0.0,
-        "boundary_cover": 0.0,
-        "boundary_repair": 0.0,
-        "boundary_repair_count": 0,
-        "edge_contact": 0.0,
-        "right_corner": 0.0,
-        "right_corner_count": 0,
-        "rect_w": float(rect_w),
-        "rect_h": float(rect_h),
-        "union_area": union_area,
-        "rect_area": rect_area,
-        "fixed_area": fixed_area,
-        "aspect_error": aspect_error,
-        "perimeter_error": perimeter_error,
-        "match_error": match_error,
-        "closure": closure_error,
-    }
-    return score, transforms, assembled, detail
-
-
-def second_question_score_assembly(transforms, assembled, matches, closure_error, reject_stats=None):
-    if SECOND_Q_USE_FAST_GEOMETRY_SCORE:
-        return second_question_score_assembly_fast(transforms, assembled, matches, closure_error, reject_stats)
-
-    all_points = np.vstack(assembled)
-    min_point = all_points.min(axis=0)
-    max_point = all_points.max(axis=0)
-    # 掩膜按 0.5 倍降采样(与参考实现一致):面积/长度按 1/scale 幂次还原,
-    # 误差远小于其他噪声项,评分速度约提升 4 倍。
-    scale = 0.5
-    inv_area = 1.0 / (scale * scale)
-    inv_len = 1.0 / scale
-    shift = -min_point * scale + SECOND_Q_SOLVE_PADDING_PX
-    width, height = np.ceil((max_point - min_point) * scale + SECOND_Q_SOLVE_PADDING_PX * 2).astype(int)
-    if width <= 1 or height <= 1 or width > WARP_W * 3 or height > WARP_H * 3:
-        return second_question_reject(reject_stats, "bad_canvas")
-
-    total = np.zeros((int(height), int(width)), dtype=np.uint8)
-    for polygon in assembled:
-        mask = np.zeros_like(total)
-        cv2.fillPoly(mask, [np.rint(polygon * scale + shift).astype(np.int32)], 1)
-        total = total + mask
-    overlap = float(np.count_nonzero(total > 1)) * inv_area
-    union = (total > 0).astype(np.uint8)
-    contours, _ = cv2.findContours(union, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return second_question_reject(reject_stats, "no_contour")
-    contour = max(contours, key=cv2.contourArea)
-    contour_points = contour.reshape(-1, 2).astype(np.float32)
-    contour_world = (contour_points - shift.reshape(1, 2)) * inv_len
-    rect = cv2.minAreaRect(contour_world)
-    rect_w, rect_h = rect[1]
-    rect_area = float(rect_w * rect_h)
-    union_area = float(np.count_nonzero(union)) * inv_area
-    if rect_area <= 1e-6:
-        return second_question_reject(reject_stats, "bad_rect")
-    if union_area <= 1e-6:
-        return second_question_reject(reject_stats, "empty_union")
-
-    piece_area = sum(
-        abs(float(cv2.contourArea(np.asarray(polygon, dtype=np.float32))))
-        for polygon in assembled
-    )
-    piece_area = max(1.0, piece_area)
-    fixed_area, fixed_aspect, fixed_perimeter = second_question_fixed_rect_metrics()
-    expected_area = fixed_area if SECOND_Q_USE_FIXED_RECT_SCORE else piece_area
-    fill_error = max(0.0, rect_area - union_area)
-    area_gap = max(0.0, rect_area - expected_area)
-    area_gap_ratio = area_gap / expected_area
-    aspect = max(float(rect_w), float(rect_h)) / max(1.0, min(float(rect_w), float(rect_h)))
-    aspect_error = abs(math.log(max(aspect, 1e-6) / max(fixed_aspect, 1e-6))) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
-    disconnected_area = float(sum(cv2.contourArea(item) for item in contours) - cv2.contourArea(contour)) * inv_area
-    hull = cv2.convexHull(contour)
-    hull_area = max(1.0, float(cv2.contourArea(hull)) * inv_area)
-    perimeter = float(cv2.arcLength(contour, True)) * inv_len
-    perimeter_error = abs(perimeter - fixed_perimeter) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
-    hull_gap = max(0.0, hull_area - float(cv2.contourArea(contour)) * inv_area)
-    hull_gap_ratio = hull_gap / expected_area
-    overlap_ratio = overlap / union_area
-    if len(assembled) == 2 and overlap_ratio > SECOND_Q_TWO_PIECE_MAX_OVERLAP_RATIO:
-        return second_question_reject(reject_stats, "overlap")
-    if len(assembled) == 2 and hull_gap_ratio > SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO:
-        return second_question_reject(reject_stats, "hull")
-    # 评分项与参考实现对齐(同 fast 路径),附加边界/直角/接触项已移除。
-    match_error = sum(float(match[0]) for match in matches) * 3000.0
-    score = (
-        closure_error * 400.0
-        + overlap * 12.0
-        + fill_error * 8.0
-        + abs(union_area - expected_area) * (SECOND_Q_FIXED_AREA_WEIGHT if SECOND_Q_USE_FIXED_RECT_SCORE else 4.0)
-        + abs(rect_area - expected_area) * 3.0
-        + aspect_error * SECOND_Q_FIXED_ASPECT_WEIGHT
-        + perimeter_error * SECOND_Q_FIXED_PERIMETER_WEIGHT
-        + disconnected_area * 20.0
-        + match_error
-    )
-    detail = {
-        "overlap": overlap,
-        "fill": union_area / rect_area,
-        "aspect": aspect,
-        "area_gap": area_gap,
-        "area_gap_ratio": area_gap_ratio,
-        "hull_gap": hull_gap,
-        "hull_gap_ratio": hull_gap_ratio,
-        "boundary": 0.0,
-        "boundary_cover": 0.0,
-        "boundary_repair": 0.0,
-        "boundary_repair_count": 0,
-        "edge_contact": 0.0,
-        "right_corner": 0.0,
-        "right_corner_count": 0,
-        "rect_w": float(rect_w),
-        "rect_h": float(rect_h),
-        "union_area": union_area,
-        "rect_area": rect_area,
-        "fixed_area": fixed_area,
-        "aspect_error": aspect_error,
-        "perimeter_error": perimeter_error,
-        "match_error": match_error,
-        "closure": closure_error,
-    }
-    return score, transforms, assembled, detail
-
-
-def second_question_dimensions_in_range(rect_w, rect_h):
-    dims_px = sorted([float(rect_w), float(rect_h)], reverse=True)
-    long_cm = dims_px[0] * A4_W_CM / max(1.0, WARP_W - 1)
-    short_cm = dims_px[1] * A4_H_CM / max(1.0, WARP_H - 1)
-    min_long = max(SECOND_Q_RECT_MIN_W_CM, SECOND_Q_RECT_MIN_H_CM) - SECOND_Q_DIMENSION_TOLERANCE_CM
-    max_long = max(SECOND_Q_RECT_MAX_W_CM, SECOND_Q_RECT_MAX_H_CM) + SECOND_Q_DIMENSION_TOLERANCE_CM
-    min_short = min(SECOND_Q_RECT_MIN_W_CM, SECOND_Q_RECT_MIN_H_CM) - SECOND_Q_DIMENSION_TOLERANCE_CM
-    max_short = min(SECOND_Q_RECT_MAX_W_CM, SECOND_Q_RECT_MAX_H_CM) + SECOND_Q_DIMENSION_TOLERANCE_CM
-    return min_long <= long_cm <= max_long and min_short <= short_cm <= max_short
-
-
-def second_question_dimension_range_penalty(rect_w, rect_h):
-    dims_px = sorted([float(rect_w), float(rect_h)], reverse=True)
-    dims_cm = [
-        dims_px[0] * A4_W_CM / max(1.0, WARP_W - 1),
-        dims_px[1] * A4_H_CM / max(1.0, WARP_H - 1),
-    ]
-    max_dim = max(SECOND_Q_RECT_MAX_W_CM, SECOND_Q_RECT_MAX_H_CM)
-    min_dim = min(SECOND_Q_RECT_MIN_W_CM, SECOND_Q_RECT_MIN_H_CM)
-    penalty = 0.0
-    if dims_cm[0] > max_dim:
-        penalty += dims_cm[0] - max_dim
-    if dims_cm[1] < min_dim:
-        penalty += min_dim - dims_cm[1]
-    return penalty
-
-
-def second_question_match_summary(matches):
-    parts = []
-    for match in matches:
-        _, piece_i, edge_i, piece_j, edge_j = match[:5]
-        parts.append(
-            "P%d%s-P%d%s"
-            % (
-                piece_i,
-                second_question_edge_label(edge_i),
-                piece_j,
-                second_question_edge_label(edge_j),
-            )
-        )
-    return ",".join(parts)
-
-
-def second_question_candidate_kind(match):
-    if tuple(match[5:]) == (0.0, 1.0, 0.0, 1.0):
-        return "full"
-    return "partial[%.2f-%.2f|%.2f-%.2f]" % tuple(float(value) for value in match[5:])
-
-
-def second_question_print_piece_edges(pieces):
-    for piece_index, polygon in enumerate(pieces):
-        contour_area = abs(float(cv2.contourArea(np.asarray(polygon, dtype=np.float32))))
-        center = np.mean(np.asarray(polygon, dtype=np.float32).reshape(-1, 2), axis=0)
-        edge_parts = []
-        min_edge = None
-        for edge_index, (edge_start, edge_end) in enumerate(polygon_edges(polygon)):
-            edge_len = float(np.linalg.norm(edge_end - edge_start))
-            min_edge = edge_len if min_edge is None else min(min_edge, edge_len)
-            edge_parts.append("E%d=%.1f" % (edge_index, edge_len))
-        print(
-            "P%d points=%d area=%.0f center=(%.1f,%.1f) %s"
-            % (
-                piece_index,
-                len(polygon),
-                contour_area,
-                float(center[0]),
-                float(center[1]),
-                " ".join(edge_parts),
-            )
-        )
-        if min_edge is not None and min_edge < SECOND_Q_DEBUG_SHORT_EDGE_PX:
-            print(
-                "WARN_SHORT_EDGE P%d min=%.1f threshold=%.1f"
-                % (piece_index, float(min_edge), float(SECOND_Q_DEBUG_SHORT_EDGE_PX))
-            )
-
-
-def second_question_print_candidate_edges(pieces, candidates):
-    pair_candidates = {}
-    for candidate in candidates:
-        pair = tuple(sorted((candidate[1], candidate[3])))
-        pair_candidates.setdefault(pair, []).append(candidate)
-
-    for piece_i, piece_j in itertools.combinations(range(len(pieces)), 2):
-        pair = (piece_i, piece_j)
-        matches = pair_candidates.get(pair, [])
-        if not matches:
-            print("NO_CAND P%d-P%d" % (piece_i, piece_j))
-            continue
-        for match in matches[:SECOND_Q_DEBUG_MAX_CAND_PRINT]:
-            score, mi, edge_i, mj, edge_j = match[:5]
-            print(
-                "CAND P%d%s-P%d%s rel=%.3f %s"
-                % (
-                    mi,
-                    second_question_edge_label(edge_i),
-                    mj,
-                    second_question_edge_label(edge_j),
-                    float(score),
-                    second_question_candidate_kind(match),
-                )
-            )
-        if len(matches) > SECOND_Q_DEBUG_MAX_CAND_PRINT:
-            print(
-                "CAND_MORE P%d-P%d omitted=%d"
-                % (piece_i, piece_j, len(matches) - SECOND_Q_DEBUG_MAX_CAND_PRINT)
-            )
-
-
-def second_question_print_top_candidates(top_candidates):
-    for rank, candidate in enumerate(top_candidates[:SECOND_Q_DEBUG_TOP_N], start=1):
-        score, cut_mode, matches, detail = candidate
-        print(
-            "SECOND Q TOP%d mode=%s score=%.1f fill=%.3f gap=%.3f hull=%.3f aspect=%.3f fix=%.0f/%.3f/%.0f overlap=%.0f boundary=%.1f cover=%.2f repair=%.1f/%d edge=%.1f right=%.1f/%d rect=%.0fx%.0f m=%s"
-            % (
-                rank,
-                cut_mode,
-                float(score),
-                float(detail.get("fill", 0.0)),
-                float(detail.get("area_gap_ratio", 0.0)),
-                float(detail.get("hull_gap_ratio", 0.0)),
-                float(detail.get("aspect", 0.0)),
-                abs(float(detail.get("rect_area", 0.0)) - float(detail.get("fixed_area", 0.0))),
-                float(detail.get("aspect_error", 0.0)),
-                float(detail.get("perimeter_error", 0.0)),
-                float(detail.get("overlap", 0.0)),
-                float(detail.get("boundary", 0.0)),
-                float(detail.get("boundary_cover", 0.0)),
-                float(detail.get("boundary_repair", 0.0)),
-                int(detail.get("boundary_repair_count", 0)),
-                float(detail.get("edge_contact", 0.0)),
-                float(detail.get("right_corner", 0.0)),
-                int(detail.get("right_corner_count", 0)),
-                float(detail.get("rect_w", 0.0)),
-                float(detail.get("rect_h", 0.0)),
-                second_question_match_summary(matches),
-            )
-        )
-
-
-def second_question_congruent_rect_dimensions(pieces):
-    """全部碎片是彼此全等的矩形时返回测得的 (长边, 短边),否则 None。
-
-    判定:4 顶点、各内角 90°±10°、对边相等(±4%)、片间尺寸一致(±4%)。
-    用于等分矩形/条带的槽位快车道,避免逐组合评分。
-    """
-    if not pieces or any(len(piece) != 4 for piece in pieces):
-        return None
-    dims = []
-    for piece in pieces:
-        angles = second_question_polygon_angles(piece)
-        if np.any(np.abs(angles - math.pi / 2) > math.radians(10.0)):
-            return None
-        lengths = [
-            float(np.linalg.norm(edge_end - edge_start))
-            for edge_start, edge_end in polygon_edges(piece)
-        ]
-        if abs(lengths[0] - lengths[2]) > 0.04 * max(lengths[0], lengths[2]):
-            return None
-        if abs(lengths[1] - lengths[3]) > 0.04 * max(lengths[1], lengths[3]):
-            return None
-        dims.append(sorted([
-            (lengths[0] + lengths[2]) / 2,
-            (lengths[1] + lengths[3]) / 2,
-        ], reverse=True))
-    first = np.asarray(dims[0], dtype=float)
-    for dim in dims[1:]:
-        if np.max(np.abs(np.asarray(dim, dtype=float) - first) / first) > 0.04:
-            return None
-    return float(first[0]), float(first[1])
-
-
-def second_question_congruent_rect_transforms(pieces):
-    """全等矩形碎片直接摆放进目标矩形槽位,不匹配时返回 None。
-
-    布局(2x2 或条带)按实测尺寸选择;完全相同的空白矩形没有可观测身份,
-    检测片与目标槽位的任意双射都是正确解。
-    """
-    count = len(pieces)
-    dims = second_question_congruent_rect_dimensions(pieces)
-    if dims is None:
-        return None
-    rect_w_px = float(SECOND_Q_FIXED_RECT_W_CM) * (WARP_W - 1) / A4_W_CM
-    rect_h_px = float(SECOND_Q_FIXED_RECT_H_CM) * (WARP_H - 1) / A4_H_CM
-    if count == 4:
-        layouts = [
-            (rect_w_px / 2, rect_h_px / 2, [
-                (0.0, 0.0), (rect_w_px / 2, 0.0),
-                (0.0, rect_h_px / 2), (rect_w_px / 2, rect_h_px / 2),
-            ]),
-            (rect_w_px / 4, rect_h_px, [
-                (index * rect_w_px / 4, 0.0) for index in range(4)
-            ]),
-        ]
-    else:
-        layouts = [
-            (rect_w_px / count, rect_h_px, [
-                (index * rect_w_px / count, 0.0) for index in range(count)
-            ]),
-        ]
-
-    def layout_cost(layout):
-        cell_w, cell_h, _slots = layout
-        return min(
-            abs(dims[0] - cell_w) + abs(dims[1] - cell_h),
-            abs(dims[0] - cell_h) + abs(dims[1] - cell_w),
-        )
-
-    cell_w, cell_h, slots = min(layouts, key=layout_cost)
-    transforms = []
-    for piece, slot in zip(pieces, slots):
-        best = None
-        for edge_start, edge_end in polygon_edges(piece):
-            vector = edge_end - edge_start
-            angle = -math.atan2(float(vector[1]), float(vector[0]))
-            rotation = rigid_transform(angle, 0.0, 0.0)
-            rotated = apply_homography_points(piece, rotation)
-            low, high = rotated.min(axis=0), rotated.max(axis=0)
-            size = high - low
-            cost = abs(size[0] - cell_w) + abs(size[1] - cell_h)
-            if best is None or cost < best[0]:
-                best = (cost, rotation, low)
-        _, rotation, low = best
-        translation = rigid_transform(
-            0.0, float(slot[0] - low[0]), float(slot[1] - low[1]))
-        transforms.append(translation.dot(rotation))
-    return transforms
-
-
-def second_question_solve_transforms(piece_polygons):
-    pieces = [np.asarray(polygon, dtype=np.float32).reshape(-1, 2) for polygon in piece_polygons]
-    if not 2 <= len(pieces) <= PIECE_MAX_COUNT:
-        raise RuntimeError("SECOND Q piece count invalid")
-
-    # 全等矩形快车道:直接摆进目标槽位(布局按实测尺寸选择),跳过逐组合评分。
-    fast_transforms = second_question_congruent_rect_transforms(pieces)
-    if fast_transforms is not None:
-        transforms = fast_transforms
-        matches = ()
-        cut_mode = "equal_rectangles"
-        print("SECOND Q OK mode=%s fast=congruent_rect matches=0" % cut_mode)
-    else:
-        candidates = second_question_candidate_matchings(pieces)
-        full_count = len([match for match in candidates if tuple(match[5:]) == (0.0, 1.0, 0.0, 1.0)])
-        partial_count = len(candidates) - full_count
-        # 拓扑枚举与切割方式无关,单次 auto 求解即可,不再逐模式重复。
-        cut_modes = ("auto",)
-        if SECOND_Q_DEBUG_CANDIDATES:
-            print("SECOND Q PIECES ver=%s n=%d cand=%d full=%d partial=%d modes=%s" % (
-                SECOND_Q_SOLVER_DEBUG_VERSION,
-                len(pieces),
-                len(candidates),
-                full_count,
-                partial_count,
-                ",".join(cut_modes),
-            ))
-            second_question_print_piece_edges(pieces)
-            second_question_print_candidate_edges(pieces, candidates)
-        best = None
-        top_candidates = []
-        tried = 0
-        accepted = 0
-        reject_stats = {}
-        solve_start_ms = time.ticks_ms()
-        solve_timed_out = False
-        for cut_mode in cut_modes:
-            if solve_timed_out:
-                break
-            mode_start_tried = tried
-            mode_start_accepted = accepted
-            print("SECOND Q MODE START %s" % cut_mode)
-            # 枚举阶段一次性完成(无法中途限时),时间预算只约束评分阶段,
-            # 避免"枚举耗光预算后只评了第一组就超时退出"。
-            combos = list(second_question_matching_sets(pieces, candidates, cut_mode))
-            print("SECOND Q COMBOS mode=%s n=%d enum=%dms" % (
-                cut_mode, len(combos), int(time.ticks_ms() - solve_start_ms)))
-            solve_start_ms = time.ticks_ms()
-            for matches in combos:
-                tried += 1
-                if SECOND_Q_SOLVE_PROGRESS_INTERVAL > 0 and tried % SECOND_Q_SOLVE_PROGRESS_INTERVAL == 0:
-                    print(
-                        "SECOND Q SOLVING mode=%s tried=%d accepted=%d best=%s"
-                        % (
-                            cut_mode,
-                            tried,
-                            accepted,
-                            "none" if best is None else "%.1f" % float(best[0]),
-                        )
-                    )
-                    if (
-                        SECOND_Q_SOLVE_TIME_LIMIT_MS > 0
-                        and time.ticks_ms() - solve_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
-                    ):
-                        print("SECOND Q TIMEOUT mode=%s tried=%d accepted=%d" % (cut_mode, tried, accepted))
-                        solve_timed_out = True
-                        break
-                result = second_question_assemble_from_matches(pieces, matches, reject_stats)
-                if result is None:
-                    continue
-                accepted += 1
-                if best is None or result[0] < best[0]:
-                    best = (result[0], result[1], result[2], matches, cut_mode, result[3])
-                top_candidates.append((result[0], cut_mode, matches, result[3]))
-                top_candidates.sort(key=lambda item: item[0])
-                if len(top_candidates) > SECOND_Q_DEBUG_TOP_N:
-                    top_candidates.pop()
-                if (
-                    SECOND_Q_SOLVE_TIME_LIMIT_MS > 0
-                    and time.ticks_ms() - solve_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
-                ):
-                    print("SECOND Q TIMEOUT mode=%s tried=%d accepted=%d" % (cut_mode, tried, accepted))
-                    solve_timed_out = True
-                    break
-            elapsed_ms = time.ticks_ms() - solve_start_ms
-            print(
-                "SECOND Q MODE END %s tried=%d accepted=%d elapsed=%dms"
-                % (cut_mode, tried - mode_start_tried, accepted - mode_start_accepted, int(elapsed_ms))
-            )
-        if best is None:
-            raise RuntimeError("SECOND Q solve failed mode=%s cand=%d full=%d partial=%d tried=%d accepted=%d reject=%s" % (
-                SECOND_Q_CUT_MODE,
-                len(candidates),
-                full_count,
-                partial_count,
-                tried,
-                accepted,
-                second_question_format_reject_stats(reject_stats),
-            ))
-
-        second_question_print_top_candidates(top_candidates)
-
-        _score, transforms, _assembled, matches, cut_mode, _detail = best
-        if len(matches) >= len(pieces):
-            transforms = second_question_optimize_pose_graph(pieces, matches, transforms)
-        print("SECOND Q OK mode=%s score=%.1f matches=%d tried=%d accepted=%d" % (
-            cut_mode,
-            float(_score),
-            len(matches),
-            tried,
-            accepted,
-        ))
-    assembled = [apply_homography_points(piece, transform) for piece, transform in zip(pieces, transforms)]
-    all_points = np.vstack(assembled).astype(np.float32)
-    rect = cv2.minAreaRect(all_points)
-    angle = float(rect[2])
-    size_w, size_h = rect[1]
-    if size_w < size_h:
-        angle += 90.0
-    normalize = rigid_transform(math.radians(-angle), 0.0, 0.0)
-    rotated = apply_homography_points(all_points, normalize)
-    min_point = rotated.min(axis=0)
-    max_point = rotated.max(axis=0)
-    if (max_point - min_point)[0] < (max_point - min_point)[1]:
-        normalize = rigid_transform(math.radians(90.0 - angle), 0.0, 0.0)
-        rotated = apply_homography_points(all_points, normalize)
-        min_point = rotated.min(axis=0)
-        max_point = rotated.max(axis=0)
-    if (max_point - min_point)[0] > (max_point - min_point)[1]:
-        rect_center = (min_point + max_point) * 0.5
-        rotate_vertical = rigid_transform(math.radians(90.0), 0.0, 0.0)
-        rotated_center = apply_homography_points(np.asarray([rect_center], dtype=np.float32), rotate_vertical)[0]
-        keep_center = rigid_transform(0.0, float(rect_center[0] - rotated_center[0]), float(rect_center[1] - rotated_center[1]))
-        normalize = keep_center.dot(rotate_vertical).dot(normalize)
-        rotated = apply_homography_points(all_points, normalize)
-        min_point = rotated.min(axis=0)
-        max_point = rotated.max(axis=0)
-    target_size = np.maximum(1.0, max_point - min_point)
-    target_rect = order_points(cv2.boxPoints(cv2.minAreaRect(rotated.astype(np.float32))))
-    return transforms, normalize, min_point, target_size, target_rect, matches
-
-
-def attach_second_question_targets(pieces):
-    if not SECOND_QUESTION_MODE or len(pieces) < 2:
-        return False
-    target_side = choose_second_question_target_side(pieces)
-    polygons = [piece.get("polygon", []) for piece in pieces]
-    try:
-        transforms, normalize, min_point, target_size, target_rect_points, _matches = second_question_solve_transforms(polygons)
-    except Exception as err:
-        print("SECOND Q SOLVE FAIL %s" % err)
-        return False
-
-    target_size = np.asarray(target_size, dtype=np.float32)
-    min_point = np.asarray(min_point, dtype=np.float32)
-    requested_scale = float(PIECE_TARGET_SHAPE_EXPAND_SCALE)
-    available_size = second_question_target_available_size(target_side)
-    fit_scale = min(
-        requested_scale,
-        float(available_size[0]) / max(1.0, float(target_size[0])),
-        float(available_size[1]) / max(1.0, float(target_size[1])),
-    )
-    expand_scale = max(0.1, fit_scale)
-    if expand_scale < requested_scale - 1e-3:
-        print(
-            "SECOND Q PREVIEW scale=%.2f requested=%.2f capped_by_fit size=%.0fx%.0f avail=%.0fx%.0f"
-            % (
-                float(expand_scale),
-                float(requested_scale),
-                float(target_size[0]),
-                float(target_size[1]),
-                float(available_size[0]),
-                float(available_size[1]),
-            )
-        )
-    target_center = min_point + target_size * 0.5
-    expand_transform = np.array(
-        [
-            [expand_scale, 0.0, target_center[0] * (1.0 - expand_scale)],
-            [0.0, expand_scale, target_center[1] * (1.0 - expand_scale)],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    expanded_min = target_center + (min_point - target_center) * expand_scale
-    expanded_size = target_size * expand_scale
-    target_origin = second_question_target_origin(target_side, expanded_size)
-    target_rect_points = np.asarray(target_rect_points, dtype=np.float32).reshape(-1, 2)
-    expanded_rect = target_center.reshape(1, 2) + (target_rect_points - target_center.reshape(1, 2)) * expand_scale
-    target_rect = np.rint(expanded_rect + (target_origin - expanded_min).reshape(1, 2)).astype(np.int32).tolist()
-    translate = rigid_transform(0.0, float(target_origin[0] - expanded_min[0]), float(target_origin[1] - expanded_min[1]))
-
-    for piece_index, piece in enumerate(pieces):
-        transform = translate.dot(expand_transform).dot(normalize).dot(transforms[piece_index])
-        polygon = np.asarray(piece.get("polygon", []), dtype=np.float32).reshape(-1, 2)
-        target_polygon = apply_homography_points(polygon, transform)
-        current_center = np.asarray(piece.get("center", polygon_center(polygon)), dtype=np.float32).reshape(1, 2)
-        target_center_point = apply_homography_points(current_center, transform)[0]
-        rotate_deg = normalize_angle_180(math.degrees(math.atan2(float(transform[1, 0]), float(transform[0, 0]))))
-        piece_name = "P%d" % piece_index
-        target_polygon_list = np.rint(target_polygon).astype(np.int32).tolist()
-        target_center_list = [int(round(float(target_center_point[0]))), int(round(float(target_center_point[1])))]
-        piece["id"] = piece_index
-        piece["template"] = piece_name
-        piece["target_side"] = target_side
-        piece["target_size"] = [float(expanded_size[0]), float(expanded_size[1])]
-        piece["target_polygon"] = target_rect
-        piece["target_center"] = target_center_list
-        piece["target_detected_polygon"] = target_polygon_list
-        piece["final_polygon"] = target_rect
-        piece["final_center"] = target_center_list
-        piece["final_detected_polygon"] = target_polygon_list
-        piece["rotate_deg"] = round(rotate_deg, 1)
-        piece["rotate_method"] = "q2"
-        piece["move"] = {
-            "pick": piece.get("center", [0, 0]),
-            "place": target_center_list,
-            "final_place": target_center_list,
-            "rotate_deg": round(rotate_deg, 1),
-            "rotate_method": "q2",
-        }
-    return True
-
-
 def build_move_plan(pieces):
     plan = []
     for piece in pieces:
@@ -3022,8 +1409,6 @@ def aggregate_capture_samples(samples):
     valid_samples = filter_a4_capture_samples(valid_samples)
     if len(valid_samples) < CAPTURE_MIN_VALID_FRAMES:
         return None, []
-    if SECOND_QUESTION_MODE:
-        return aggregate_second_question_capture_samples(valid_samples)
 
     grouped = {}
     for sample in valid_samples:
@@ -3065,118 +1450,6 @@ def aggregate_capture_samples(samples):
         for piece in aggregated_pieces
     ]
     return result, piece_contours
-
-
-def aggregate_second_question_capture_samples(valid_samples):
-    count_histogram = {}
-    for sample in valid_samples:
-        piece_count = len(sample.get("pieces", []))
-        if 2 <= piece_count <= PIECE_MAX_COUNT:
-            count_histogram[piece_count] = count_histogram.get(piece_count, 0) + 1
-    if not count_histogram:
-        observed = {}
-        for sample in valid_samples:
-            piece_count = len(sample.get("pieces", []))
-            observed[piece_count] = observed.get(piece_count, 0) + 1
-        print("SECOND Q FAIL piece_count_hist=%s need=2..%d" % (observed, PIECE_MAX_COUNT))
-        return None, []
-    expected_count = max(count_histogram.items(), key=lambda item: item[1])[0]
-    samples = [sample for sample in valid_samples if len(sample.get("pieces", [])) == expected_count]
-    if len(samples) < CAPTURE_MIN_VALID_FRAMES:
-        print("SECOND Q FAIL stable_count=%d frames=%d" % (expected_count, len(samples)))
-        return None, []
-
-    base_pieces = sorted(samples[0].get("pieces", []), key=lambda piece: (piece["center"][1], piece["center"][0]))
-    grouped = [[base_piece] for base_piece in base_pieces]
-    base_centers = [np.asarray(piece["center"], dtype=np.float32) for piece in base_pieces]
-    for sample in samples[1:]:
-        pieces = sorted(sample.get("pieces", []), key=lambda piece: (piece["center"][1], piece["center"][0]))
-        order = best_piece_order_by_center(base_centers, pieces)
-        if order is None:
-            continue
-        for group_index, piece_index in enumerate(order):
-            grouped[group_index].append(pieces[piece_index])
-
-    aggregated_pieces = []
-    for piece_index, group in enumerate(grouped):
-        if len(group) < CAPTURE_MIN_VALID_FRAMES:
-            continue
-        filtered = filter_second_question_piece_samples(group)
-        if len(filtered) < CAPTURE_MIN_VALID_FRAMES:
-            continue
-        aggregated_pieces.append(average_second_question_piece_samples(piece_index, filtered))
-
-    if len(aggregated_pieces) != expected_count:
-        print("SECOND Q FAIL aggregated=%d expected=%d" % (len(aggregated_pieces), expected_count))
-        return None, []
-    if not attach_second_question_targets(aggregated_pieces):
-        print("SECOND Q FAIL solve pieces=%d" % len(aggregated_pieces))
-        return None, []
-
-    corners = average_a4_corners(samples)
-    result = {
-        "status": True,
-        "stable": True,
-        "question_mode": QUESTION_MODE,
-        "corners": corners,
-        "midline": standard_midline(),
-        "pieces_count": len(aggregated_pieces),
-        "pieces": aggregated_pieces,
-        "move_plan": build_move_plan(aggregated_pieces),
-        "capture_frames": len(samples),
-    }
-    piece_contours = [
-        np.asarray(piece["polygon"], dtype=np.int32).reshape(-1, 1, 2)
-        for piece in aggregated_pieces
-    ]
-    return result, piece_contours
-
-
-def best_piece_order_by_center(base_centers, pieces):
-    if len(base_centers) != len(pieces):
-        return None
-    centers = [np.asarray(piece["center"], dtype=np.float32) for piece in pieces]
-    best_order = None
-    best_error = None
-    for order in itertools.permutations(range(len(pieces))):
-        error = 0.0
-        for base_index, piece_index in enumerate(order):
-            error += float(np.linalg.norm(base_centers[base_index] - centers[piece_index]))
-        if best_error is None or error < best_error:
-            best_error = error
-            best_order = order
-    if best_error is not None and best_error > CAPTURE_OUTLIER_CENTER_PX * len(pieces):
-        return None
-    return best_order
-
-
-def filter_second_question_piece_samples(pieces):
-    centers = np.asarray([piece.get("center", [0, 0]) for piece in pieces], dtype=np.float32)
-    median_center = np.median(centers, axis=0)
-    filtered = []
-    for piece, center in zip(pieces, centers):
-        center_error = float(np.linalg.norm(center - median_center))
-        if center_error <= CAPTURE_OUTLIER_CENTER_PX:
-            filtered.append(piece)
-    return filtered
-
-
-def average_second_question_piece_samples(piece_index, pieces):
-    center = average_points([piece.get("center", [0, 0]) for piece in pieces])
-    polygon = average_polygon_field(pieces, "polygon") or pieces[0].get("polygon", [])
-    expanded_polygon = average_polygon_field(pieces, "expanded_polygon") or polygon
-    return {
-        "id": piece_index,
-        "area": int(round(float(np.mean([piece.get("area", 0) for piece in pieces])))),
-        "source_area": int(round(float(np.mean([piece.get("source_area", 0) for piece in pieces])))),
-        "center": center,
-        "bbox": bbox_from_polygon(polygon),
-        "side": "left" if center[0] < WARP_W // 2 else "right",
-        "points": len(polygon),
-        "polygon": polygon,
-        "expanded_polygon": expanded_polygon,
-        "template": "P%d" % piece_index,
-    }
 
 
 def filter_a4_capture_samples(samples):
@@ -3332,11 +1605,6 @@ def piece_name_to_id(name):
         return 2
     if name == "D":
         return 3
-    if isinstance(name, str) and name.startswith("P"):
-        try:
-            return int(name[1:])
-        except Exception:
-            return 9
     return 9
 
 
@@ -3843,49 +2111,9 @@ def draw_pieces(frame, pieces, piece_contours):
         cx, cy = piece["center"]
         cv2.circle(frame, (cx, cy), 4, YELLOW, -1)
         label = str(piece["id"])
-        if piece.get("template"):
+        if FIRST_QUESTION_MODE and piece.get("template"):
             label += ":" + piece["template"]
         cv2.putText(frame, label, (cx + 5, max(12, cy - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BLUE, 1)
-
-
-def draw_question_targets(frame, pieces):
-    if SECOND_QUESTION_MODE:
-        draw_second_question_targets(frame, pieces)
-    else:
-        draw_first_question_targets(frame, pieces)
-
-
-def draw_second_question_targets(frame, pieces):
-    if not SECOND_QUESTION_MODE or not pieces:
-        return
-
-    target_side = None
-    rect_points = None
-    for piece in pieces or []:
-        if piece.get("target_side"):
-            target_side = piece["target_side"]
-        if piece.get("target_polygon"):
-            rect_points = piece["target_polygon"]
-        if target_side is not None and rect_points is not None:
-            break
-    if target_side is None:
-        target_side = choose_second_question_target_side(pieces or [])
-    if rect_points is None:
-        rect_points = second_question_target_rect(target_side).round().astype(np.int32).tolist()
-
-    rect = np.asarray(rect_points, dtype=np.int32).reshape(-1, 1, 2)
-    cv2.drawContours(frame, [rect], -1, CYAN, 1)
-
-    for piece in pieces or []:
-        if "target_center" not in piece:
-            continue
-        if piece.get("target_detected_polygon"):
-            detected_polygon = np.asarray(piece["target_detected_polygon"], dtype=np.int32).reshape(-1, 1, 2)
-            cv2.drawContours(frame, [detected_polygon], -1, CYAN, 2)
-        tx, ty = piece["target_center"]
-        cv2.circle(frame, (int(tx), int(ty)), 3, CYAN, -1)
-        label = piece.get("template", "P%d" % piece.get("id", 0))
-        cv2.putText(frame, label, (int(tx) + 4, max(12, int(ty) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
 
 
 def draw_first_question_targets(frame, pieces):
@@ -4053,7 +2281,7 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
         else:
             view = a4_warp.copy() if a4_warp is not None else warp_a4(frame, result["corners"])[0]
             cv2.drawContours(view, piece_debug.get("accepted_source_contours", []), -1, RED, 1)
-            draw_question_targets(view, pieces or [])
+            draw_first_question_targets(view, pieces or [])
             draw_pieces(view, pieces or [], piece_contours or [])
             draw_warp_result(view, result, fps)
         draw_piece_debug_info(view, result, fps, piece_debug)
@@ -4061,7 +2289,7 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
 
     if DISPLAY_MODE == 1 and result.get("status"):
         view = a4_warp.copy() if a4_warp is not None else warp_a4(frame, result["corners"])[0]
-        draw_question_targets(view, pieces or [])
+        draw_first_question_targets(view, pieces or [])
         draw_pieces(view, pieces or [], piece_contours or [])
         draw_warp_result(view, result, fps)
         return view
