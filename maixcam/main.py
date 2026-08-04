@@ -9,6 +9,7 @@ import math
 import itertools
 import struct
 import heapq
+import gc
 
 
 # =========================
@@ -44,19 +45,32 @@ APPROX_EPSILON_RATIO = 0.025   # 多边形拟合精度比例，用于把 A4 轮�
 MIN_AREA_RATIO = 0.07          # A4 候选最小面积占整帧比例，过滤小噪声。
 MAX_AREA_RATIO = 0.65          # A4 候选最大面积占整帧比例，过滤异常大区域。
 
+# 绿色比赛纸优先检测；白色碎片在绿色区域中只是孔洞，不会改变纸张外轮廓。
+A4_GREEN_DETECTION_ENABLED = True
+A4_GREEN_MIN_AREA_RATIO = 0.15          # 绿色纸最小画面占比。
+A4_GREEN_MAX_AREA_RATIO = 0.92          # 允许纸张靠近镜头，占据大部分画面。
+A4_GREEN_MIN_COVERAGE_RATIO = 0.48      # 四边形内至少有多少比例仍是绿色，容纳白色碎片和阴影。
+A4_GREEN_MEDIAN_KERNEL = 5              # 仅平滑 A4 颜色掩膜，不参与碎片轮廓提取。
+A4_GREEN_CLOSE_KERNEL = (9, 9)          # 连接绿色纸外边缘的小断点。
+A4_GREEN_APPROX_EPSILONS = (0.008, 0.012, 0.018, 0.025, 0.035, 0.050)
+
 # 防止把中间黑线分出的半张纸当成 A4。
 # 如果同一帧里存在更大的 A4 外轮廓，即使它没有拟合成四边形，小候选也会被过滤。
 CANDIDATE_MIN_RELATIVE_AREA = 0.65
 
 # A4 外框允许连续丢失的帧数；短暂遮挡/抖动时不立刻清空检测状态。
 MAX_LOST_FRAMES = 5
+A4_STABILIZER_ALPHA = 0.30              # 同一检测来源的小抖动低通系数，新帧占比。
+A4_STABILIZER_MAX_CORNER_JUMP_PX = 35.0 # 超过该角点跳变不做平均，避免错误四边形拖偏结果。
+A4_EDGE_SWITCH_CONFIRM_FRAMES = 3       # 已有绿色结果时，接近的 edge 回退需连续确认帧数。
+A4_EDGE_SWITCH_TOLERANCE_PX = 18.0      # 连续 edge 候选之间允许的最大角点变化。
 
 # 题目模式和碎片识别总开关。
 PIECE_DETECTION_ENABLED = True     # 是否启用碎片检测；False 时只检测/显示 A4 外框。
 QUESTION_MODE = 2                  # 当前题号：1 使用第一问模板匹配，2 使用第二问通用拼接。
 FIRST_QUESTION_MODE = QUESTION_MODE == 1
 SECOND_QUESTION_MODE = QUESTION_MODE == 2
-PIECE_MASK_METHOD = "black"        # 碎片分割方式；black 表示按黑色背景和亮度/颜色差分提取碎片。
+PIECE_MASK_METHOD = "hsv"        # 碎片分割方式；hsv 表示按绿色背景和 HSV 色差提取碎片。
 PIECE_PROCESS_A4_ROI = True        # 是否只在透视后的 A4 区域内处理碎片，减少画面外干扰。
 
 # 背景采样和 Lab 色差参数。
@@ -73,8 +87,9 @@ PIECE_GREEN_S_LOW = 52             # S 饱和度下限，太低说明颜色偏�
 PIECE_GREEN_S_HIGH = 255           # S 饱和度上限。
 PIECE_GREEN_V_LOW = 75             # V 亮度下限。
 PIECE_GREEN_V_HIGH = 255           # V 亮度上限。
-PIECE_HSV_DIFF_THRESHOLD = 35.0    # HSV 差分阈值，用于辅助判断目标和背景差异。
-PIECE_HSV_DIFF_BLUR_KERNEL = (5, 5)# HSV 差分图模糊核，减少小噪点。
+# 绿色模式只把明确满足 H/S 条件的像素当背景；低饱和白边不会再因绿色反光被吃掉。
+PIECE_HSV_MEDIAN_ENABLED = True    # 是否对绿色模式最终二值 mask 做 3x3 中值滤波；尖角仍被削时可关闭。
+PIECE_DEBUG_OVERLAY_RAW_CONTOUR = False # 模式 1 同屏显示红色原始轮廓和蓝色最终多边形。
 
 # 黑色背景分割参数；现场黑底时，用 V 通道亮度把碎片从背景中提出来。
 # 这里的阈值比第一问参考文件更低，是为了保留阴影区或反光较弱的碎片角点。
@@ -114,7 +129,11 @@ PIECE_A4_MASK_INNER_SCALE = 1.0         # A4 mask 内缩比例；1.0 表示不�
 PIECE_FRAME_MASK_MARGIN = 0            # A4 mask 腐蚀边距；第二问贴边时设 0，避免削掉边缘角。
 PIECE_MIN_BBOX_SIDE = 8                # 外接框最小边长，过滤极小轮廓。
 PIECE_MAX_ASPECT_RATIO = 8.0           # 外接框最大长宽比，过滤细长线状噪声。
-PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.20 # 拼好后的目标显示/匹配放大倍数。
+PIECE_TARGET_SHAPE_EXPAND_SCALE = 1.00 # 保持实物真实尺寸；第二问安全间距改用固定毫米值。
+SECOND_Q_TARGET_GAP_MM = 5.0             # 拼接完成后相邻碎片的计划安全间距，固定毫米值。
+SECOND_Q_CLEARANCE_CONTACT_PARALLEL_MIN = 0.94 # 自动补充接缝时，两边方向平行度下限。
+SECOND_Q_CLEARANCE_CONTACT_DISTANCE_PX = 12.0 # 自动补充接缝时，两条支撑线最大距离。
+SECOND_Q_CLEARANCE_CONTACT_OVERLAP_PX = 10.0 # 自动补充接缝时，沿边方向最小重合长度。
 
 # 第一问目标矩形和模板参数，单位厘米。
 FIRST_Q_RECT_W_CM = 10.0               # 第一问目标矩形宽度。
@@ -174,10 +193,13 @@ SECOND_Q_PARTIAL_MATCHES_PER_PAIR = 22 # 每对碎片保留多少个局部/T 边
 # 组合惩罚预算剪枝:超过该预算的组合不可能进入最终短名单。
 SECOND_Q_COMBO_PENALTY_BUDGET = 0.75
 # 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时。
-SECOND_Q_MAX_SCORED_COMBOS = 800       # 最多进入光栅化评分的组合数。
+SECOND_Q_MAX_SCORED_COMBOS = 2500      # 通用回退保留更多组合，避免 800 个候选截断正确答案。
 SECOND_Q_MAX_SOLVE_COMBOS = 2500       # 预留的最大求解组合数上限。
 SECOND_Q_MAX_MATCHING_COMBO_CHECKS = 20000 # 预留的匹配组合检查上限。
-SECOND_Q_SOLVE_TIME_LIMIT_MS = 8000    # 第二问单次求解软时间限制，单位毫秒。
+SECOND_Q_SOLVE_TIME_LIMIT_MS = 60000   # 视觉求解总硬时间预算；给机械抓放预留约 20 秒以上。
+SECOND_Q_AUTO_GEOMETRY_FINALISTS = 384 # 纯几何预筛后进入小图粗筛的候选数。
+SECOND_Q_AUTO_COARSE_MASK_SCALE = 0.16 # auto 全量粗筛掩膜比例；只用于排序，不作为最终验收结果。
+SECOND_Q_AUTO_FINALISTS = 96           # 粗筛后进入原完整评分的候选数，兼顾正确率和板端耗时。
 # 新拼接算法以光栅化掩膜评分为准(同参考实现);凸包近似评分对凹片/五边形会误判。
 SECOND_Q_USE_FAST_GEOMETRY_SCORE = False
 
@@ -186,16 +208,28 @@ SECOND_Q_USE_FAST_GEOMETRY_SCORE = False
 # Use "all_reference" to scan the reference simulator's named modes.
 SECOND_Q_CUT_MODE = "branched_spine"   # 当前优先使用的参考拓扑名称，实际求解阶段会走 auto 枚举。
 SECOND_Q_REFERENCE_MATCHING = True     # 是否启用参考拓扑风格的边匹配策略。
-SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v16-aspectsoft" # 调试输出中的求解器版本标记。
+SECOND_Q_SOLVER_DEBUG_VERSION = "q2topology-v56-clearance-contacts" # 日志版本，确认 MaixVision 未覆盖新文件。
 # 第二问遇到第一问官方切法时先按官方邻接拓扑跑第二问算法,失败再回全量通用搜索。
 SECOND_Q_FIRST_TEMPLATE_DETECT_ENABLED = True
 SECOND_Q_FIRST_TEMPLATE_TOPOLOGY_FIRST = True
 SECOND_Q_FIRST_TEMPLATE_MAX_COST = 1.60
-SECOND_Q_FIRST_TEMPLATE_MAX_SHAPE_SCORE = 0.36
+SECOND_Q_FIRST_TEMPLATE_MAX_SHAPE_SCORE = 0.42
 SECOND_Q_FIRST_TEMPLATE_AREA_WEIGHT = 0.80       # 打乱摆放时面积/阴影波动较大,这里只弱化面积约束。
 SECOND_Q_FIRST_TEMPLATE_POINT_WEIGHT = 0.04      # 角点数量只作弱参考,避免拟合多/少一个点就漏检。
-SECOND_Q_FIRST_TEMPLATE_CANDIDATES_PER_PAIR = 6   # 第一问拓扑快车道中每对相邻碎片最多保留的接缝候选。
-SECOND_Q_FIRST_TEMPLATE_MAX_SCORED_COMBOS = 80    # 第一问拓扑快车道最多评分的组合数。
+SECOND_Q_FIRST_TEMPLATE_CANDIDATES_PER_PAIR = 16  # 放宽每对接缝候选，容纳裁剪和轮廓抖动。
+SECOND_Q_FIRST_TEMPLATE_MAX_SCORED_COMBOS = 900   # 官方拓扑范围小，可保留更完整的组合。
+SECOND_Q_FIRST_TEMPLATE_RING_CANDIDATES_PER_PAIR = 8  # 外圈快路按模板接缝长度排序后每对保留数量。
+SECOND_Q_FIRST_TEMPLATE_RING_MAX_SCORED_COMBOS = 160 # 外圈四边闭环优先评分上限。
+SECOND_Q_FIRST_TEMPLATE_GUIDED_MAPS_PER_PIECE = 6 # 每块保留多套模板顶点映射，抵抗轮廓抖动和多余角点。
+SECOND_Q_FIRST_TEMPLATE_GUIDED_MAX_SETS = 24      # 四块映射组合后最多尝试的官方引导拼法数量。
+SECOND_Q_FIRST_TEMPLATE_CONFIDENT_MAX_COST = 0.85 # 只有高置信模板命中才允许快速结束。
+SECOND_Q_FIRST_TEMPLATE_CONFIDENT_MAX_SHAPE = 0.30
+SECOND_Q_FIRST_TEMPLATE_EARLY_FILL = 0.95         # 高填充、低重叠矩形可提前结束第一问搜索。
+SECOND_Q_FIRST_TEMPLATE_EARLY_OVERLAP_RATIO = 0.02
+SECOND_Q_FIRST_TEMPLATE_EARLY_MAX_BOUNDARY_MISSING = 0.15 # 外边界缺失过多时不得提前采用错误闭环。
+SECOND_Q_FIRST_TEMPLATE_MIN_CLEARANCE_RATIO = 0.95 # 官方快路必须实际留出至少 95% 的目标机械间隔。
+SECOND_Q_FIRST_TEMPLATE_PREFILTER_FILL = 0.90      # 闭环优化前只保留已经接近矩形的候选。
+SECOND_Q_FIRST_TEMPLATE_PREFILTER_OVERLAP = 0.08  # 优化前允许少量裁剪/识别误差造成的重叠。
 
 # 第二问边界/直角/接触评分参数；当前主评分与参考实现对齐，部分项只保留给调试或备用。
 SECOND_Q_BOUNDARY_EDGE_WEIGHT = 80.0
@@ -258,6 +292,7 @@ ENABLE_KEY_EXIT = True                 # 是否允许按键退出程序。
 AUTO_CAPTURE_ON_START = True           # 程序启动后是否自动执行一次稳定捕获并发送结果。
 SEND_SERIAL_ON_KEY_PRESS = True        # 是否保留按键再次触发捕获/发送。
 PERF_PROFILE = True                    # 是否统计每帧处理耗时。
+TASK_MEMORY_GC_ENABLED = True          # 捕获/预览阶段结束后主动释放样本、求解缓存和循环引用。
 
 # 稳定捕获参数；自动执行或按键触发后连续采集多帧，剔除离群值后输出稳定结果。
 CAPTURE_FRAME_COUNT = 60               # 一次捕获最多处理帧数。
@@ -284,22 +319,39 @@ MECH_COORD_OUTPUT_ENABLED = True       # 是否输出机械坐标。
 MECH_SWAP_XY_FOR_STM32 = True          # 是否交换 X/Y，适配 STM32 端坐标定义。
 MECH_COORD_DECIMALS = 0                # 机械坐标输出保留小数位数。
 MECH_ROTATE_SCALE = 10.0               # 旋转角缩放倍数，适配下位机协议。
-# 机械端系统误差补偿:如果抓取点/放置点都偏向 A4 中线,说明横向比例略小或机械端有固定回缩。
-# scale > 1 会把点按 A4 中心成比例向外推;outward_mm 会按所在方向额外远离中心固定距离。
-MECH_CENTERLINE_COMPENSATION_ENABLED = True # 是否启用中心偏差补偿。
 
-MECH_CENTERLINE_X_SCALE = 1.00         # 横向离中线距离放大倍率；偏中线就调大，偏外侧就调小。
-MECH_CENTERLINE_X_OUTWARD_MM = 3.0     # 左右两侧各自远离中线的固定补偿，单位 mm。
-MECH_CENTERLINE_X_OFFSET_MM = -1.0     # 横向整体平移补偿，单位 mm；左右都同向偏时再调它。+往右 -往左
 
-MECH_CENTERLINE_Y_SCALE = 1.05         # 纵向离中心线距离放大倍率；偏中心就调大，偏外侧就调小。
-MECH_CENTERLINE_Y_OUTWARD_MM = 0.0     # 上下两侧各自远离中心线的固定补偿，单位 mm。
-MECH_CENTERLINE_Y_OFFSET_MM = 2.0      # 纵向整体平移补偿，单位 mm；+往下 -往上。
+# 视觉坐标到 STM32 坐标的补偿分为全局、抓取专用和放置专用三层。
+
+# 全局比例以 A4 中心为基准，同时修正抓取和放置坐标的范围误差。
+MECH_GLOBAL_X_SCALE = 1.06             # 左右都偏向中线时调大，偏向外侧时调小。
+MECH_GLOBAL_Y_SCALE = 1.05             # 上下都偏向中线时调大，偏向外侧时调小。
+MECH_GLOBAL_ROTATION_DEG = 1.62        # 整个机械坐标系绕 A4 中心旋转，+顺时针，-逆时针。
+
+# 全局偏移同时移动抓取与放置坐标，用于手动对齐两套坐标系的整体原点偏差。
+MECH_GLOBAL_FIXED_OFFSET_X_MM = -0.0    # 全部机械坐标沿 A4 透视图水平方向移动，+向右，单位 mm。
+MECH_GLOBAL_FIXED_OFFSET_Y_MM = 4.5    # 全部机械坐标沿 A4 透视图垂直方向移动，+向下，单位 mm。
+
+
+# 抓取/放置专用补偿只处理各自动作剩余的固定残差。
+MECH_PICK_FIXED_OFFSET_X_MM = 0.0      # 抓取 X 偏心补偿归零，重新进行机械标定。
+MECH_PICK_FIXED_OFFSET_Y_MM = 0.0      # 抓取 Y 偏心补偿归零，重新进行机械标定。
+MECH_PLACE_FIXED_OFFSET_X_MM = 0.0     # 放置 X 固定补偿归零，重新进行机械标定。
+MECH_PLACE_FIXED_OFFSET_Y_MM = 0.0     # 放置 Y 固定补偿归零，重新进行机械标定。
 MECH_CALIBRATION_POINTS = [
     [0.0, 0.0],
     [A4_W_MM, 0.0],
     [A4_W_MM, A4_H_MM],
     [0.0, A4_H_MM],
+]
+# 推荐标定方式：直接填写 STM32 最终坐标系里的 A4 四角 TL/TR/BR/BL。
+# 默认值与上面的旧标定加 XY 交换完全等价，因此启用后不会改变当前坐标。
+MECH_DIRECT_OUTPUT_CALIBRATION_ENABLED = True
+MECH_OUTPUT_CALIBRATION_POINTS = [
+    [0.0, 0.0],
+    [0.0, A4_W_MM],
+    [A4_H_MM, A4_W_MM],
+    [A4_H_MM, 0.0],
 ]
 
 # 显示模式：0 原图 + A4 外框，1 透视图 + 最终碎片，2 色差图，3 raw mask，4 clean mask，5 候选轮廓，6 筛选结果 + 参数。
@@ -312,7 +364,7 @@ DEBUG_VIEW_MODE = 0
 
 # 目标预览贴图：把左侧检测到的碎片图案也变换到右侧目标位置，便于检查花纹方向。
 PREVIEW_TEXTURE_ENABLED = True
-PREVIEW_TEXTURE_ALPHA = 1.0
+PREVIEW_TEXTURE_ALPHA = 0.30
 
 # OpenCV 绘图颜色，顺序是 BGR，不是 RGB。
 GREEN = (0, 255, 0)
@@ -323,12 +375,57 @@ BLACK = (0, 0, 0)
 BLUE = (255, 0, 0)
 CYAN = (255, 255, 0)
 
+# 每块拼图使用不同的显示颜色（BGR）；目标矩形外框仍统一使用 CYAN。
+PIECE_DISPLAY_COLORS = [
+    (255, 0, 0),    # P0：蓝色
+    (255, 0, 255),  # P1：品红
+    (0, 165, 255),  # P2：橙色
+    (0, 255, 255),  # P3：黄色
+]
+
+
+def piece_display_color(piece):
+    """按稳定的碎片 ID 返回预览颜色，避免摆放顺序变化时颜色跳变。"""
+    try:
+        piece_id = int(piece.get("id", 0))
+    except (TypeError, ValueError):
+        piece_id = 0
+    return PIECE_DISPLAY_COLORS[piece_id % len(PIECE_DISPLAY_COLORS)]
+
 # 运行时状态和缓存，避免每帧重复计算固定模板。
 capture_requested = AUTO_CAPTURE_ON_START  # 是否已经请求一次稳定捕获；启动自动执行时初始为 True。
 first_question_area_ratios_cache = None     # 第一问模板面积比例缓存。
 first_question_template_contour_cache = {}  # 第一问模板轮廓缓存。
 first_question_target_layout_cache = {}     # 第一问目标布局缓存。
 rotation_target_sample_cache = {}           # 旋转匹配采样点缓存。
+
+
+def release_task_memory(capture_samples=None):
+    """释放一次视觉任务不再需要的样本和求解缓存，不影响冻结结果预览。"""
+    released_samples = 0
+    if capture_samples is not None:
+        released_samples = len(capture_samples)
+        capture_samples.clear()
+    released_rotation_cache = len(rotation_target_sample_cache)
+    rotation_target_sample_cache.clear()
+    if TASK_MEMORY_GC_ENABLED:
+        gc.collect()
+    return released_samples, released_rotation_cache
+
+
+def close_runtime_resource(resource):
+    """兼容不同 MaixPy 版本，安全关闭带 close/deinit 方法的运行资源。"""
+    if resource is None:
+        return
+    for method_name in ("close", "deinit"):
+        method = getattr(resource, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            method()
+        except Exception:
+            pass
+        break
 
 
 # =========================
@@ -424,6 +521,12 @@ class A4Detector:
         self.debug = {}
 
     def detect(self, frame):
+        if A4_GREEN_DETECTION_ENABLED:
+            green_result, green_debug = self.detect_green_paper(frame)
+            if green_result is not None:
+                self.debug = green_debug
+                return green_result
+
         frame_area = frame.shape[0] * frame.shape[1]
         gray, blur, canny, edges = self.preprocess(frame)
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -516,7 +619,89 @@ class A4Detector:
             "corners": corners,
             "warp_size": [WARP_W, WARP_H],
             "midline": standard_midline(),
+            "a4_method": "edge",
         }
+
+    @staticmethod
+    def detect_green_paper(frame):
+        """优先由绿色纸的外轮廓定位 A4，碎片孔洞不会干扰最外层边界。"""
+        frame_area = float(frame.shape[0] * frame.shape[1])
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower = np.array([PIECE_GREEN_H_LOW, PIECE_GREEN_S_LOW, 0], dtype=np.uint8)
+        upper = np.array([PIECE_GREEN_H_HIGH, PIECE_GREEN_S_HIGH, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        if A4_GREEN_MEDIAN_KERNEL >= 3:
+            kernel = int(A4_GREEN_MEDIAN_KERNEL)
+            if kernel % 2 == 0:
+                kernel += 1
+            mask = cv2.medianBlur(mask, kernel)
+        close_kernel = np.ones(A4_GREEN_CLOSE_KERNEL, dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best = None
+        candidate_count = 0
+        for contour in contours:
+            contour_area = abs(float(cv2.contourArea(contour)))
+            area_ratio = contour_area / max(1.0, frame_area)
+            if not A4_GREEN_MIN_AREA_RATIO <= area_ratio <= A4_GREEN_MAX_AREA_RATIO:
+                continue
+            hull = cv2.convexHull(contour)
+            perimeter = float(cv2.arcLength(hull, True))
+            if perimeter <= 1e-6:
+                continue
+            approx = None
+            for epsilon_ratio in A4_GREEN_APPROX_EPSILONS:
+                candidate = cv2.approxPolyDP(hull, perimeter * epsilon_ratio, True)
+                if len(candidate) == 4 and cv2.isContourConvex(candidate):
+                    approx = candidate
+                    break
+            if approx is None:
+                continue
+
+            corners = order_points(approx.reshape(4, 2))
+            ratio = quad_aspect_ratio(corners)
+            if not A4_RATIO_MIN <= ratio <= A4_RATIO_MAX:
+                continue
+            angles = quad_angles(corners)
+            if not all(ANGLE_MIN <= angle <= ANGLE_MAX for angle in angles):
+                continue
+
+            quad_mask = np.zeros(mask.shape, dtype=np.uint8)
+            cv2.fillConvexPoly(quad_mask, np.rint(corners).astype(np.int32), 255)
+            quad_pixels = max(1, int(cv2.countNonZero(quad_mask)))
+            green_pixels = int(cv2.countNonZero(cv2.bitwise_and(mask, quad_mask)))
+            coverage_ratio = green_pixels / float(quad_pixels)
+            if coverage_ratio < A4_GREEN_MIN_COVERAGE_RATIO:
+                continue
+            candidate_count += 1
+            quad_area = abs(float(cv2.contourArea(corners.astype(np.float32))))
+            score = quad_area * (0.5 + coverage_ratio)
+            if best is None or score > best[0]:
+                best = (score, corners, area_ratio, coverage_ratio, ratio, angles)
+
+        debug = {
+            "method": "green",
+            "contours": len(contours),
+            "candidates": candidate_count,
+        }
+        if best is None:
+            return None, debug
+        _score, corners, area_ratio, coverage_ratio, ratio, angles = best
+        debug.update({
+            "best_area_ratio": area_ratio,
+            "best_green_coverage": coverage_ratio,
+            "best_aspect_ratio": ratio,
+            "best_angles": angles,
+        })
+        return {
+            "status": True,
+            "corners": np.rint(corners).astype(np.int32).tolist(),
+            "warp_size": [WARP_W, WARP_H],
+            "midline": standard_midline(),
+            "a4_method": "green",
+            "a4_green_coverage": coverage_ratio,
+        }, debug
 
     @staticmethod
     def preprocess(frame):
@@ -533,22 +718,92 @@ class A4ResultStabilizer:
         self.max_lost_frames = max_lost_frames
         self.last_result = {"status": False}
         self.lost_frames = 0
+        self.pending_edge_result = None
+        self.pending_edge_frames = 0
+
+    @staticmethod
+    def corner_jump(result_a, result_b):
+        corners_a = np.asarray(result_a.get("corners", []), dtype=np.float32).reshape(-1, 2)
+        corners_b = np.asarray(result_b.get("corners", []), dtype=np.float32).reshape(-1, 2)
+        if corners_a.shape != (4, 2) or corners_b.shape != (4, 2):
+            return float("inf")
+        return float(np.max(np.linalg.norm(corners_a - corners_b, axis=1)))
+
+    def accept(self, result, smooth):
+        accepted = result.copy()
+        if smooth and self.last_result.get("status"):
+            previous = np.asarray(self.last_result["corners"], dtype=np.float32)
+            current = np.asarray(result["corners"], dtype=np.float32)
+            blended = previous * (1.0 - A4_STABILIZER_ALPHA) + current * A4_STABILIZER_ALPHA
+            accepted["corners"] = np.rint(blended).astype(np.int32).tolist()
+            accepted["a4_smoothed"] = True
+        accepted["stable"] = True
+        accepted["lost_frames"] = 0
+        self.last_result = accepted
+        self.lost_frames = 0
+        return self.last_result
+
+    def hold_last(self, reason):
+        self.lost_frames += 1
+        if not self.last_result.get("status") or self.lost_frames > self.max_lost_frames:
+            return {"status": False, "a4_reject_reason": reason}
+        stable_result = self.last_result.copy()
+        stable_result["stable"] = True
+        stable_result["held"] = True
+        stable_result["lost_frames"] = self.lost_frames
+        stable_result["a4_reject_reason"] = reason
+        return stable_result
 
     def update(self, result):
         if result.get("status"):
-            self.last_result = result.copy()
-            self.last_result["stable"] = True
-            self.last_result["lost_frames"] = 0
-            self.lost_frames = 0
-            return self.last_result
+            if not self.last_result.get("status"):
+                self.pending_edge_result = None
+                self.pending_edge_frames = 0
+                return self.accept(result, smooth=False)
 
+            current_method = result.get("a4_method", "edge")
+            last_method = self.last_result.get("a4_method", "edge")
+            jump = self.corner_jump(self.last_result, result)
+
+            # 绿色外轮廓是当前比赛纸的直接证据；恢复后立即接管，大跳变不参与平均。
+            if current_method == "green":
+                self.pending_edge_result = None
+                self.pending_edge_frames = 0
+                return self.accept(
+                    result, smooth=jump <= A4_STABILIZER_MAX_CORNER_JUMP_PX)
+
+            # 已稳定在绿色纸时，单帧 Canny 四边形不能直接覆盖它。
+            if last_method == "green":
+                if jump > A4_STABILIZER_MAX_CORNER_JUMP_PX:
+                    self.pending_edge_result = None
+                    self.pending_edge_frames = 0
+                    return self.hold_last("edge_jump_from_green")
+                if (
+                    self.pending_edge_result is not None
+                    and self.corner_jump(self.pending_edge_result, result)
+                    <= A4_EDGE_SWITCH_TOLERANCE_PX
+                ):
+                    self.pending_edge_frames += 1
+                else:
+                    self.pending_edge_result = result.copy()
+                    self.pending_edge_frames = 1
+                self.pending_edge_result = result.copy()
+                if self.pending_edge_frames < A4_EDGE_SWITCH_CONFIRM_FRAMES:
+                    return self.hold_last("edge_wait_confirm")
+                self.pending_edge_result = None
+                self.pending_edge_frames = 0
+                return self.accept(result, smooth=True)
+
+            self.pending_edge_result = None
+            self.pending_edge_frames = 0
+            if jump <= A4_STABILIZER_MAX_CORNER_JUMP_PX:
+                return self.accept(result, smooth=True)
+            return self.hold_last("edge_corner_jump")
+
+        self.pending_edge_result = None
+        self.pending_edge_frames = 0
         if self.last_result.get("status") and self.lost_frames < self.max_lost_frames:
-            self.lost_frames += 1
-            stable_result = self.last_result.copy()
-            stable_result["stable"] = True
-            stable_result["held"] = True
-            stable_result["lost_frames"] = self.lost_frames
-            return stable_result
+            return self.hold_last("detect_lost")
 
         self.last_result = {"status": False}
         self.lost_frames = 0
@@ -783,11 +1038,11 @@ def make_piece_debug(
         else:
             debug["all_contours"] = warp_contours(all_contours, matrix)
 
-    if DISPLAY_MODE == 6:
-        if DEBUG_SHOW_ORIGINAL_PROCESS:
+    # 模式 1 也缓存透视后的原始 mask 轮廓，用于红蓝轮廓同屏对照。
+    if DISPLAY_MODE == 6 or PIECE_DEBUG_OVERLAY_RAW_CONTOUR:
+        debug["accepted_source_contours"] = warp_contours(accepted_source_contours, matrix)
+        if DISPLAY_MODE == 6 and DEBUG_SHOW_ORIGINAL_PROCESS:
             debug["accepted_source_contours_original"] = accepted_source_contours
-        else:
-            debug["accepted_source_contours"] = warp_contours(accepted_source_contours, matrix)
 
     debug["accepted_contours"] = accepted_contours
     return debug
@@ -844,37 +1099,27 @@ def make_piece_mask(frame, detect_mask):
 
 def make_piece_mask_hsv(frame, detect_mask):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    distance_map = hsv_outside_green_distance(hsv)
-    distance_map = smooth_distance_map(distance_map, detect_mask)
-    piece_mask = np.where(distance_map > PIECE_HSV_DIFF_THRESHOLD, 255, 0).astype(np.uint8)
-    piece_mask = cv2.bitwise_and(piece_mask, detect_mask)
-    piece_mask = smooth_piece_mask(piece_mask, detect_mask)
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
 
-    if DISPLAY_MODE != 2:
-        distance_map = np.zeros(piece_mask.shape, dtype=np.float32)
+    # 只有色相和饱和度都明确符合绿色纸特征时才判为背景。
+    # 白色、灰色、阴影和扑克深色花纹会因饱和度较低而保留。
+    green_background = (
+        (h >= PIECE_GREEN_H_LOW)
+        & (h <= PIECE_GREEN_H_HIGH)
+        & (s >= PIECE_GREEN_S_LOW)
+        & (s <= PIECE_GREEN_S_HIGH)
+    )
+    piece_mask = np.where(green_background, 0, 255).astype(np.uint8)
+    piece_mask = cv2.bitwise_and(piece_mask, detect_mask)
+    if PIECE_HSV_MEDIAN_ENABLED:
+        piece_mask = smooth_piece_mask(piece_mask, detect_mask)
+
+    # 模式 2 显示滤波前的绿色分类，白色表示非绿色。
+    distance_map = np.where(green_background, 0.0, 255.0).astype(np.float32)
+    distance_map *= detect_mask.astype(np.float32) / 255.0
     bg_color = np.array([PIECE_GREEN_H_LOW, PIECE_GREEN_S_LOW, PIECE_GREEN_V_LOW], dtype=np.float32)
     return distance_map, piece_mask, bg_color
-
-
-def hsv_outside_green_distance(hsv):
-    hsv_float = hsv.astype(np.float32)
-    h = hsv_float[:, :, 0]
-    s = hsv_float[:, :, 1]
-    v = hsv_float[:, :, 2]
-
-    h_dist = np.maximum(np.maximum(PIECE_GREEN_H_LOW - h, h - PIECE_GREEN_H_HIGH), 0.0)
-    s_dist = np.maximum(np.maximum(PIECE_GREEN_S_LOW - s, s - PIECE_GREEN_S_HIGH), 0.0)
-    v_dist = np.maximum(np.maximum(PIECE_GREEN_V_LOW - v, v - PIECE_GREEN_V_HIGH), 0.0)
-    return np.sqrt(h_dist * h_dist + s_dist * s_dist + v_dist * v_dist)
-
-
-def smooth_distance_map(distance_map, detect_mask):
-    distance_map = distance_map * (detect_mask.astype(np.float32) / 255.0)
-    if PIECE_HSV_DIFF_BLUR_KERNEL[0] <= 1 or PIECE_HSV_DIFF_BLUR_KERNEL[1] <= 1:
-        return distance_map
-
-    blurred = cv2.GaussianBlur(distance_map, PIECE_HSV_DIFF_BLUR_KERNEL, 0)
-    return blurred * (detect_mask.astype(np.float32) / 255.0)
 
 
 def make_piece_mask_black(frame, detect_mask):
@@ -2013,6 +2258,8 @@ def second_question_matching_sets(
     allowed_pairs=None,
     pair_candidate_limit=None,
     tree_only=False,
+    cycle_only=False,
+    candidate_priorities=None,
 ):
     """按碎片对拓扑枚举匹配组合:full/partial 任意混合,|E| = N-1 或 N。
 
@@ -2034,8 +2281,14 @@ def second_question_matching_sets(
         if allowed_pairs is not None and pair not in allowed_pairs:
             continue
         group = by_pair.setdefault(pair, [])
-        if pair_candidate_limit is None or len(group) < int(pair_candidate_limit):
-            group.append(match)
+        group.append(match)
+    for group in by_pair.values():
+        group.sort(key=lambda item: (
+            candidate_priorities.get(item, float(item[0]))
+            if candidate_priorities is not None else float(item[0])
+        ))
+        if pair_candidate_limit is not None:
+            del group[int(pair_candidate_limit):]
     # 预计算每个候选的边区间占用,避免递归内重复调用辅助函数(枚举是耗时大头)
     active_candidates = [match for matches in by_pair.values() for match in matches]
     claims_cache = {}
@@ -2053,8 +2306,6 @@ def second_question_matching_sets(
         ]
         claims_cache[match] = claims
     pair_list = sorted(by_pair)
-    valid = []
-    valid_sequence = 0
 
     def connected(topo):
         degree = [0] * count
@@ -2074,60 +2325,87 @@ def second_question_matching_sets(
                     stack.append(neighbor)
         return len(seen) == count
 
-    topology_sizes = (count - 1,) if tree_only else (count - 1, count)
+    if cycle_only:
+        topology_sizes = (count,)
+    elif tree_only:
+        topology_sizes = (count - 1,)
+    else:
+        topology_sizes = (count - 1, count)
+    topologies = []
     for size in topology_sizes:
         if size < 1 or size > len(pair_list):
             continue
-        for topo in itertools.combinations(pair_list, size):
-            if not connected(topo):
+        topologies.extend(
+            topo for topo in itertools.combinations(pair_list, size)
+            if connected(topo)
+        )
+
+    def match_penalty(match):
+        if candidate_priorities is not None:
+            return float(candidate_priorities.get(match, float(match[0])))
+        return float(match[0])
+
+    def state_penalty(topo, indices):
+        return sum(match_penalty(by_pair[pair][index]) for pair, index in zip(topo, indices))
+
+    def combo_has_conflict(combo):
+        used = {}
+        for match in combo:
+            for piece_index, component, start_t, end_t in claims_cache[match]:
+                for used_start, used_end in used.get((piece_index, component), ()):
+                    if max(start_t, used_start) < min(end_t, used_end) - 1e-4:
+                        return True
+                used.setdefault((piece_index, component), []).append((start_t, end_t))
+        return False
+
+    # 每个拓扑是一组有序候选列表的笛卡尔积。用 best-first 同时推进全部
+    # 拓扑，直接按总惩罚升序产生合法组合，避免先穷举再截取前 max_scored。
+    frontier = []
+    visited = set()
+    sequence = 0
+    for topology_index, topo in enumerate(topologies):
+        if any(not by_pair[pair] for pair in topo):
+            continue
+        indices = (0,) * len(topo)
+        penalty = state_penalty(topo, indices)
+        if penalty > SECOND_Q_COMBO_PENALTY_BUDGET:
+            continue
+        heapq.heappush(frontier, (penalty, sequence, topology_index, indices))
+        visited.add((topology_index, indices))
+        sequence += 1
+
+    yielded = 0
+    checked = 0
+    while frontier and yielded < max_scored:
+        _penalty, _sequence, topology_index, indices = heapq.heappop(frontier)
+        checked += 1
+        if SECOND_Q_MAX_MATCHING_COMBO_CHECKS > 0 and checked > SECOND_Q_MAX_MATCHING_COMBO_CHECKS:
+            break
+        topo = topologies[topology_index]
+        combo = tuple(by_pair[pair][index] for pair, index in zip(topo, indices))
+        if not combo_has_conflict(combo):
+            yielded += 1
+            yield combo
+
+        for dimension, pair in enumerate(topo):
+            next_index = indices[dimension] + 1
+            if next_index >= len(by_pair[pair]):
                 continue
-            chosen = []
-            used = {}
-
-            def rec(index, penalty):
-                if index == len(topo):
-                    nonlocal valid_sequence
-                    combo = tuple(chosen)
-                    entry = (-float(penalty), valid_sequence, combo)
-                    valid_sequence += 1
-                    if len(valid) < max_scored:
-                        heapq.heappush(valid, entry)
-                    elif entry > valid[0]:
-                        heapq.heapreplace(valid, entry)
-                    return
-                # 惩罚预算剪枝:超过预算的组合不可能进入最终短名单
-                for match in by_pair[topo[index]]:
-                    new_penalty = penalty + float(match[0])
-                    if new_penalty > SECOND_Q_COMBO_PENALTY_BUDGET:
-                        break  # 每对候选按惩罚升序,后续更贵
-                    claims = claims_cache[match]
-                    conflict = False
-                    for piece_index, component, start_t, end_t in claims:
-                        for used_start, used_end in used.get((piece_index, component), ()):
-                            if max(start_t, used_start) < min(end_t, used_end) - 1e-4:
-                                conflict = True
-                                break
-                        if conflict:
-                            break
-                    if conflict:
-                        continue
-                    for piece_index, component, start_t, end_t in claims:
-                        used.setdefault((piece_index, component), []).append((start_t, end_t))
-                    chosen.append(match)
-                    rec(index + 1, new_penalty)
-                    chosen.pop()
-                    for piece_index, component, _start_t, _end_t in claims:
-                        bucket = used[(piece_index, component)]
-                        bucket.pop()
-                        if not bucket:
-                            del used[(piece_index, component)]
-
-            rec(0, 0.0)
-    # 惩罚升序截断:长度/角度证据最好的组合先进评分,控制最坏耗时。
-    best = [(-neg_penalty, combo) for neg_penalty, _seq, combo in valid]
-    best.sort(key=lambda item: item[0])
-    for _penalty, combo in best:
-        yield combo
+            next_indices = list(indices)
+            next_indices[dimension] = next_index
+            next_indices = tuple(next_indices)
+            state_key = (topology_index, next_indices)
+            if state_key in visited:
+                continue
+            next_penalty = state_penalty(topo, next_indices)
+            if next_penalty > SECOND_Q_COMBO_PENALTY_BUDGET:
+                continue
+            visited.add(state_key)
+            heapq.heappush(
+                frontier,
+                (next_penalty, sequence, topology_index, next_indices),
+            )
+            sequence += 1
 
 
 
@@ -2143,34 +2421,78 @@ def second_question_format_reject_stats(reject_stats):
     return ",".join("%s=%d" % (key, reject_stats[key]) for key in sorted(reject_stats))
 
 
+def second_question_candidate_clearance_ok(result, matches, reject_stats, strict_gap=False):
+    """最终候选必须能通过平移消除重叠；官方模板还要求基本达到计划间距。"""
+    if result is None or SECOND_Q_TARGET_GAP_MM <= 0.0:
+        return result is not None
+    px_per_mm = 0.5 * (
+        (WARP_W - 1.0) / A4_W_MM
+        + (WARP_H - 1.0) / A4_H_MM
+    )
+    requested_gap_px = float(SECOND_Q_TARGET_GAP_MM) * px_per_mm
+    _offsets, _shifted, achieved_gap_px, clearance_overlap = (
+        second_question_apply_clearance(result[2], matches, requested_gap_px)
+    )
+    clearance_ratio = achieved_gap_px / max(1e-6, requested_gap_px)
+    result[3]["clearance_ratio"] = clearance_ratio
+    result[3]["clearance_overlap"] = clearance_overlap
+    if clearance_overlap > 1.0:
+        second_question_reject(reject_stats, "clearance_overlap")
+        return False
+    if strict_gap and clearance_ratio < SECOND_Q_FIRST_TEMPLATE_MIN_CLEARANCE_RATIO:
+        second_question_reject(reject_stats, "template_clearance")
+        return False
+    return True
+
+
 def second_question_rectlike_reject_reason(contour_world, rect_area, union_area, hull_area, aspect, fixed_aspect):
     if not SECOND_Q_RECTLIKE_REJECT_ENABLED:
         return None
     if rect_area <= 1e-6 or union_area <= 1e-6:
-        return "rectlike_empty"
+        return "矩形_空"
 
     fill_ratio = float(union_area) / max(1.0, float(rect_area))
     if fill_ratio < SECOND_Q_RECTLIKE_MIN_FILL_RATIO:
-        return "rectlike_fill"
+        return "矩形_填充率低"
 
     hull_gap_ratio = max(0.0, float(hull_area) - float(union_area)) / max(1.0, float(union_area))
     if hull_gap_ratio > SECOND_Q_RECTLIKE_MAX_HULL_GAP_RATIO:
-        return "rectlike_hull"
+        return "矩形_凸包间隙大"
 
     contour = np.asarray(contour_world, dtype=np.float32).reshape(-1, 1, 2)
     perimeter = float(cv2.arcLength(contour, True))
     if perimeter <= 1e-6:
-        return "rectlike_perimeter"
+        return "矩形_周长为零"
     approx = cv2.approxPolyDP(contour, SECOND_Q_RECT_APPROX_EPSILON_RATIO * perimeter, True)
     if len(approx) > SECOND_Q_RECTLIKE_MAX_CONTOUR_POINTS:
-        return "rectlike_points"
+        return "矩形_轮廓点过多"
 
     # 长宽比受碎片缺角、阴影缝和 minAreaRect 方向影响很大；这里不能一票否决。
     # 具体偏离量继续在 second_question_score_assembly() 里作为软评分项处理。
     return None
 
 
-def second_question_assemble_from_matches(pieces, matches, reject_stats=None):
+def second_question_pose_graph_closure_error(pieces, matches, transforms):
+    """返回全部已声明接缝在当前位姿下的平均端点误差（像素）。"""
+    errors = []
+    for match in matches:
+        _, piece_i, _edge_i, piece_j, _edge_j = match[:5]
+        ia, ib, ja, jb = second_question_match_segments(pieces, match)
+        world_i = apply_homography_points(np.asarray([ia, ib], dtype=np.float32), transforms[piece_i])
+        world_j = apply_homography_points(np.asarray([jb, ja], dtype=np.float32), transforms[piece_j])
+        errors.extend(np.linalg.norm(world_i - world_j, axis=1).tolist())
+    return float(np.mean(errors)) if errors else 0.0
+
+def second_question_assemble_from_matches(
+    pieces,
+    matches,
+    reject_stats=None,
+    optimize_cycle=False,
+    use_fixed_rect_score=None,
+    mask_scale=0.5,
+    coarse_score=False,
+    geometry_score=False,
+):
     adjacency = [[] for _ in pieces]
     for match in matches:
         _, piece_i, _edge_i, piece_j, _edge_j = match[:5]
@@ -2200,7 +2522,38 @@ def second_question_assemble_from_matches(pieces, matches, reject_stats=None):
     if any(transform is None for transform in transforms):
         return second_question_reject(reject_stats, "disconnected")
     assembled = [apply_homography_points(piece, transform) for piece, transform in zip(pieces, transforms)]
-    return second_question_score_assembly(transforms, assembled, matches, closure_error, reject_stats)
+    if optimize_cycle and len(matches) >= len(pieces):
+        # 先用未优化位姿做便宜预筛，避免给明显错误的闭环运行 LM。
+        raw_result = second_question_score_assembly(
+            transforms, assembled, matches, closure_error, reject_stats, apply_rectlike_reject=False, use_fixed_rect_score=use_fixed_rect_score)
+        if raw_result is None:
+            return None
+        raw_detail = raw_result[3]
+        raw_union = max(1.0, float(raw_detail.get("union_area", 1.0)))
+        raw_overlap_ratio = float(raw_detail.get("overlap", 0.0)) / raw_union
+        if (
+            float(raw_detail.get("fill", 0.0)) < SECOND_Q_FIRST_TEMPLATE_PREFILTER_FILL
+            or raw_overlap_ratio > SECOND_Q_FIRST_TEMPLATE_PREFILTER_OVERLAP
+        ):
+            return second_question_reject(reject_stats, "template_cycle_prefilter")
+        transforms = second_question_optimize_pose_graph(pieces, matches, transforms)
+        assembled = [
+            apply_homography_points(piece, transform)
+            for piece, transform in zip(pieces, transforms)
+        ]
+        closure_error = second_question_pose_graph_closure_error(pieces, matches, transforms)
+    if geometry_score:
+        return second_question_score_assembly_fast(
+            transforms, assembled, matches, closure_error, reject_stats,
+            use_fixed_rect_score=use_fixed_rect_score,
+            coarse_score=coarse_score,
+        )
+    return second_question_score_assembly(
+        transforms, assembled, matches, closure_error, reject_stats,
+        use_fixed_rect_score=use_fixed_rect_score,
+        mask_scale=mask_scale,
+        coarse_score=coarse_score,
+    )
 
 
 def second_question_boundary_edge_error(assembled, rect, matches):
@@ -2591,7 +2944,18 @@ def second_question_right_corner_error(assembled, rect):
     return total_error, max_error, len(right_points)
 
 
-def second_question_score_assembly_fast(transforms, assembled, matches, closure_error, reject_stats=None):
+def second_question_score_assembly_fast(
+    transforms,
+    assembled,
+    matches,
+    closure_error,
+    reject_stats=None,
+    apply_rectlike_reject=True,
+    use_fixed_rect_score=None,
+    coarse_score=False,
+):
+    if use_fixed_rect_score is None:
+        use_fixed_rect_score = SECOND_Q_USE_FIXED_RECT_SCORE
     all_points = np.vstack(assembled).astype(np.float32)
     min_point = all_points.min(axis=0)
     max_point = all_points.max(axis=0)
@@ -2604,6 +2968,8 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
     rect_area = float(rect_w * rect_h)
     if rect_area <= 1e-6:
         return second_question_reject(reject_stats, "bad_rect")
+    if (apply_rectlike_reject or coarse_score) and not second_question_dimensions_in_range(rect_w, rect_h):
+        return second_question_reject(reject_stats, "矩形_尺寸越界")
 
     piece_area = sum(
         abs(float(cv2.contourArea(np.asarray(polygon, dtype=np.float32))))
@@ -2611,18 +2977,18 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
     )
     piece_area = max(1.0, piece_area)
     fixed_area, fixed_aspect, fixed_perimeter = second_question_fixed_rect_metrics()
-    expected_area = fixed_area if SECOND_Q_USE_FIXED_RECT_SCORE else piece_area
+    expected_area = fixed_area if use_fixed_rect_score else piece_area
     overlap = second_question_pairwise_overlap_area(assembled)
     union_area = max(1.0, piece_area - overlap)
     fill_error = max(0.0, rect_area - union_area)
     area_gap = max(0.0, rect_area - expected_area)
     area_gap_ratio = area_gap / expected_area
     aspect = max(float(rect_w), float(rect_h)) / max(1.0, min(float(rect_w), float(rect_h)))
-    aspect_error = abs(math.log(max(aspect, 1e-6) / max(fixed_aspect, 1e-6))) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
+    aspect_error = abs(math.log(max(aspect, 1e-6) / max(fixed_aspect, 1e-6))) if use_fixed_rect_score else 0.0
     hull = cv2.convexHull(all_points.reshape(-1, 1, 2))
     hull_area = max(1.0, float(cv2.contourArea(hull)))
     perimeter = float(cv2.arcLength(hull, True))
-    perimeter_error = abs(perimeter - fixed_perimeter) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
+    perimeter_error = abs(perimeter - fixed_perimeter) if use_fixed_rect_score else 0.0
     hull_gap = max(0.0, hull_area - expected_area)
     hull_gap_ratio = hull_gap / expected_area
     overlap_ratio = overlap / union_area
@@ -2631,16 +2997,34 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
     if len(assembled) == 2 and hull_gap_ratio > SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO:
         return second_question_reject(reject_stats, "hull")
 
+    if coarse_score:
+        boundary_error = 0.0
+        boundary_max_error = 0.0
+        boundary_cover_error = 0.0
+        boundary_missing_ratio = 0.0
+    else:
+        boundary_error, boundary_max_error = second_question_boundary_edge_error(
+            assembled, rect, matches)
+        boundary_cover_error, boundary_missing_ratio = second_question_boundary_coverage_error(
+            assembled, rect, matches)
+        if SECOND_Q_STRICT_BOUNDARY_REJECT and (
+            boundary_max_error > SECOND_Q_BOUNDARY_EDGE_MAX_ERROR_PX
+            or boundary_missing_ratio > 0.20
+        ):
+            return second_question_reject(reject_stats, "矩形_边界不完整")
+
     # fast 路径只保留外轮廓近似评分；默认矩形硬约束开启时不会走到这里。
     match_error = sum(float(match[0]) for match in matches) * 3000.0
     score = (
         closure_error * 400.0
         + overlap * 12.0
         + fill_error * 8.0
-        + abs(union_area - expected_area) * (SECOND_Q_FIXED_AREA_WEIGHT if SECOND_Q_USE_FIXED_RECT_SCORE else 4.0)
+        + abs(union_area - expected_area) * (SECOND_Q_FIXED_AREA_WEIGHT if use_fixed_rect_score else 4.0)
         + abs(rect_area - expected_area) * 3.0
         + aspect_error * SECOND_Q_FIXED_ASPECT_WEIGHT
         + perimeter_error * SECOND_Q_FIXED_PERIMETER_WEIGHT
+        + boundary_error * SECOND_Q_BOUNDARY_EDGE_WEIGHT
+        + boundary_cover_error * SECOND_Q_BOUNDARY_COVER_WEIGHT
         + match_error
     )
     detail = {
@@ -2651,8 +3035,11 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
         "area_gap_ratio": area_gap_ratio,
         "hull_gap": hull_gap,
         "hull_gap_ratio": hull_gap_ratio,
-        "boundary": 0.0,
-        "boundary_cover": 0.0,
+        "boundary": boundary_error,
+        "boundary_cover": boundary_missing_ratio,
+        "boundary_max": boundary_max_error,
+        "boundary_cover_error": boundary_cover_error,
+        "dynamic_rect": not bool(use_fixed_rect_score),
         "boundary_repair": 0.0,
         "boundary_repair_count": 0,
         "edge_contact": 0.0,
@@ -2672,16 +3059,32 @@ def second_question_score_assembly_fast(transforms, assembled, matches, closure_
     return score, transforms, assembled, detail
 
 
-def second_question_score_assembly(transforms, assembled, matches, closure_error, reject_stats=None):
+def second_question_score_assembly(
+    transforms,
+    assembled,
+    matches,
+    closure_error,
+    reject_stats=None,
+    apply_rectlike_reject=True,
+    use_fixed_rect_score=None,
+    mask_scale=0.5,
+    coarse_score=False,
+):
+    if use_fixed_rect_score is None:
+        use_fixed_rect_score = SECOND_Q_USE_FIXED_RECT_SCORE
     if SECOND_Q_USE_FAST_GEOMETRY_SCORE and not SECOND_Q_RECTLIKE_REJECT_ENABLED:
-        return second_question_score_assembly_fast(transforms, assembled, matches, closure_error, reject_stats)
+        return second_question_score_assembly_fast(
+            transforms, assembled, matches, closure_error, reject_stats,
+            apply_rectlike_reject=apply_rectlike_reject,
+            use_fixed_rect_score=use_fixed_rect_score,
+        )
 
     all_points = np.vstack(assembled)
     min_point = all_points.min(axis=0)
     max_point = all_points.max(axis=0)
-    # 掩膜按 0.5 倍降采样(与参考实现一致):面积/长度按 1/scale 幂次还原,
-    # 误差远小于其他噪声项,评分速度约提升 4 倍。
-    scale = 0.5
+    # 最终评分按 0.5 倍降采样；auto 全量粗筛使用更小掩膜，只负责候选排序。
+    # 面积和长度按比例还原，粗筛结果不会直接作为最终机械目标。
+    scale = max(0.08, float(mask_scale))
     inv_area = 1.0 / (scale * scale)
     inv_len = 1.0 / scale
     shift = -min_point * scale + SECOND_Q_SOLVE_PADDING_PX
@@ -2717,17 +3120,17 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
     )
     piece_area = max(1.0, piece_area)
     fixed_area, fixed_aspect, fixed_perimeter = second_question_fixed_rect_metrics()
-    expected_area = fixed_area if SECOND_Q_USE_FIXED_RECT_SCORE else piece_area
+    expected_area = fixed_area if use_fixed_rect_score else piece_area
     fill_error = max(0.0, rect_area - union_area)
     area_gap = max(0.0, rect_area - expected_area)
     area_gap_ratio = area_gap / expected_area
     aspect = max(float(rect_w), float(rect_h)) / max(1.0, min(float(rect_w), float(rect_h)))
-    aspect_error = abs(math.log(max(aspect, 1e-6) / max(fixed_aspect, 1e-6))) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
+    aspect_error = abs(math.log(max(aspect, 1e-6) / max(fixed_aspect, 1e-6))) if use_fixed_rect_score else 0.0
     disconnected_area = float(sum(cv2.contourArea(item) for item in contours) - cv2.contourArea(contour)) * inv_area
     hull = cv2.convexHull(contour)
     hull_area = max(1.0, float(cv2.contourArea(hull)) * inv_area)
     perimeter = float(cv2.arcLength(contour, True)) * inv_len
-    perimeter_error = abs(perimeter - fixed_perimeter) if SECOND_Q_USE_FIXED_RECT_SCORE else 0.0
+    perimeter_error = abs(perimeter - fixed_perimeter) if use_fixed_rect_score else 0.0
     hull_gap = max(0.0, hull_area - float(cv2.contourArea(contour)) * inv_area)
     hull_gap_ratio = hull_gap / expected_area
     overlap_ratio = overlap / union_area
@@ -2736,6 +3139,28 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
     if len(assembled) == 2 and hull_gap_ratio > SECOND_Q_TWO_PIECE_MAX_HULL_GAP_RATIO:
         return second_question_reject(reject_stats, "hull")
 
+    if (apply_rectlike_reject or coarse_score) and not second_question_dimensions_in_range(rect_w, rect_h):
+        return second_question_reject(reject_stats, "矩形_尺寸越界")
+
+    if coarse_score:
+        # 边界覆盖包含多层 Python 循环，是板端全量搜索的主要热点。
+        # 粗筛只按尺寸/填充/重叠排序，完整边界验收留给最终候选。
+        boundary_error = 0.0
+        boundary_max_error = 0.0
+        boundary_cover_error = 0.0
+        boundary_missing_ratio = 0.0
+    else:
+        boundary_error, boundary_max_error = second_question_boundary_edge_error(
+            assembled, rect, matches)
+        boundary_cover_error, boundary_missing_ratio = second_question_boundary_coverage_error(
+            assembled, rect, matches)
+        if SECOND_Q_STRICT_BOUNDARY_REJECT and (
+            boundary_max_error > SECOND_Q_BOUNDARY_EDGE_MAX_ERROR_PX
+            or boundary_missing_ratio > 0.20
+        ):
+            return second_question_reject(reject_stats, "矩形_边界不完整")
+
+    # 低分辨率轮廓会产生量化折角，粗筛不能据此硬拒绝；最终评分仍执行完整矩形约束。
     rectlike_reason = second_question_rectlike_reject_reason(
         contour_world,
         rect_area,
@@ -2743,7 +3168,7 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
         hull_area,
         aspect,
         fixed_aspect,
-    )
+    ) if apply_rectlike_reject and not coarse_score else None
     if rectlike_reason is not None:
         return second_question_reject(reject_stats, rectlike_reason)
 
@@ -2753,11 +3178,13 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
         closure_error * 400.0
         + overlap * 12.0
         + fill_error * 8.0
-        + abs(union_area - expected_area) * (SECOND_Q_FIXED_AREA_WEIGHT if SECOND_Q_USE_FIXED_RECT_SCORE else 4.0)
+        + abs(union_area - expected_area) * (SECOND_Q_FIXED_AREA_WEIGHT if use_fixed_rect_score else 4.0)
         + abs(rect_area - expected_area) * 3.0
         + aspect_error * SECOND_Q_FIXED_ASPECT_WEIGHT
         + perimeter_error * SECOND_Q_FIXED_PERIMETER_WEIGHT
         + disconnected_area * 20.0
+        + boundary_error * SECOND_Q_BOUNDARY_EDGE_WEIGHT
+        + boundary_cover_error * SECOND_Q_BOUNDARY_COVER_WEIGHT
         + match_error
     )
     detail = {
@@ -2768,8 +3195,11 @@ def second_question_score_assembly(transforms, assembled, matches, closure_error
         "area_gap_ratio": area_gap_ratio,
         "hull_gap": hull_gap,
         "hull_gap_ratio": hull_gap_ratio,
-        "boundary": 0.0,
-        "boundary_cover": 0.0,
+        "boundary": boundary_error,
+        "boundary_cover": boundary_missing_ratio,
+        "boundary_max": boundary_max_error,
+        "boundary_cover_error": boundary_cover_error,
+        "dynamic_rect": not bool(use_fixed_rect_score),
         "boundary_repair": 0.0,
         "boundary_repair_count": 0,
         "edge_contact": 0.0,
@@ -2876,7 +3306,7 @@ def second_question_print_candidate_edges(pieces, candidates):
         pair = (piece_i, piece_j)
         matches = pair_candidates.get(pair, [])
         if not matches:
-            print("NO_CAND P%d-P%d" % (piece_i, piece_j))
+            print("无候选 P%d-P%d" % (piece_i, piece_j))
             continue
         for match in matches[:SECOND_Q_DEBUG_MAX_CAND_PRINT]:
             score, mi, edge_i, mj, edge_j = match[:5]
@@ -2961,6 +3391,14 @@ def second_question_congruent_rect_dimensions(pieces):
     return float(first[0]), float(first[1])
 
 
+def second_question_first_template_is_confident(match):
+    return bool(
+        match is not None
+        and float(match.get("cost", 999.0)) <= SECOND_Q_FIRST_TEMPLATE_CONFIDENT_MAX_COST
+        and float(match.get("max_shape_score", 999.0)) <= SECOND_Q_FIRST_TEMPLATE_CONFIDENT_MAX_SHAPE
+    )
+
+
 def second_question_first_template_allowed_pairs(match):
     if (
         not SECOND_Q_FIRST_TEMPLATE_TOPOLOGY_FIRST
@@ -2989,6 +3427,227 @@ def second_question_first_template_allowed_pairs(match):
     return pairs or None
 
 
+def second_question_first_template_ring_priorities(pieces, candidates, match):
+    """返回官方 A-B-C-D 外圈闭环及按实测接缝长度计算的候选优先级。
+
+    模板只用于决定先搜索哪些相邻关系和预期接缝长度；候选位姿、最终轮廓
+    和机械坐标仍完全来自实测多边形，不使用模板坐标直接摆放。
+    """
+    if match is None or len(match.get("assignment", ())) != 4:
+        return None, None
+    template_to_piece = {}
+    piece_names = {}
+    for piece_index, template_index in enumerate(match["assignment"]):
+        name = FIRST_Q_TEMPLATES[template_index]["name"]
+        template_to_piece[name] = piece_index
+        piece_names[piece_index] = name
+    seam_lengths_cm = {
+        frozenset(("A", "B")): 3.6878,
+        frozenset(("B", "C")): 7.6942,
+        frozenset(("C", "D")): 3.0,
+        frozenset(("D", "A")): 2.0,
+    }
+    pair_lengths = {}
+    for names, length_cm in seam_lengths_cm.items():
+        name_a, name_b = tuple(names)
+        if name_a not in template_to_piece or name_b not in template_to_piece:
+            return None, None
+        pair = tuple(sorted((template_to_piece[name_a], template_to_piece[name_b])))
+        pair_lengths[pair] = float(length_cm)
+
+    measured_area = sum(
+        abs(float(cv2.contourArea(np.asarray(piece, dtype=np.float32))))
+        for piece in pieces
+    )
+    px_per_cm = math.sqrt(max(1.0, measured_area) / 60.0)
+    priorities = {}
+    for candidate in candidates:
+        pair = tuple(sorted((candidate[1], candidate[3])))
+        expected_cm = pair_lengths.get(pair)
+        if expected_cm is None:
+            continue
+        ia, ib, ja, jb = second_question_match_segments(pieces, candidate)
+        measured_length = 0.5 * (
+            float(np.linalg.norm(ib - ia)) + float(np.linalg.norm(jb - ja))
+        )
+        expected_length = max(1.0, expected_cm * px_per_cm)
+        length_error = abs(measured_length - expected_length) / expected_length
+        _, piece_i, _edge_i, piece_j, _edge_j, ia0, ia1, ja0, ja1 = candidate
+        interval_by_piece = {piece_i: (ia0, ia1), piece_j: (ja0, ja1)}
+        structure_error = 0.0
+        for piece_index in pair:
+            start_t, end_t = interval_by_piece[piece_index]
+            if piece_names[piece_index] == "D":
+                # D 的完整斜边约 10 cm，外圈接缝只占靠端点的一段。
+                structure_error += abs((end_t - start_t) - expected_cm / 10.0)
+            else:
+                structure_error += abs(start_t) + abs(1.0 - end_t)
+        priorities[candidate] = (
+            length_error
+            + 0.35 * structure_error
+            + 0.05 * float(candidate[0])
+        )
+    return set(pair_lengths), priorities
+
+
+def second_question_template_vertex_correspondences(piece, template_index, limit=None):
+    """返回按误差排序的模板顶点映射，允许实测轮廓多出共线/短边顶点。"""
+    template_cm = np.asarray(FIRST_Q_TEMPLATES[template_index]["polygon_cm"], dtype=np.float32)
+    template = np.empty_like(template_cm)
+    template[:, 0] = template_cm[:, 0] * (WARP_W - 1) / A4_W_CM
+    template[:, 1] = template_cm[:, 1] * (WARP_H - 1) / A4_H_CM
+    perimeter = float(cv2.arcLength(template.reshape(-1, 1, 2), True))
+    template = cv2.approxPolyDP(
+        template.reshape(-1, 1, 2), max(1e-4, perimeter * 0.001), True
+    ).reshape(-1, 2).astype(np.float32)
+    template = second_question_normalize_polygon_winding(template)
+    measured = second_question_normalize_polygon_winding(piece)
+    if len(template) < 3 or len(measured) < len(template):
+        return []
+
+    target = template - np.mean(template, axis=0)
+    target_norm = float(np.linalg.norm(target))
+    if target_norm <= 1e-6:
+        return []
+    target /= target_norm
+    ranked = {}
+    for selected in itertools.combinations(range(len(measured)), len(template)):
+        base_indices = np.asarray(selected, dtype=np.int32)
+        for ordered_indices in (base_indices, base_indices[::-1]):
+            for shift in range(len(template)):
+                indices = np.roll(ordered_indices, -shift)
+                source = measured[indices] - np.mean(measured[indices], axis=0)
+                source_norm = float(np.linalg.norm(source))
+                if source_norm <= 1e-6:
+                    continue
+                source /= source_norm
+                angle = rotation_angle_between_point_sets(source, target)
+                mapped = rotate_points_clockwise(source, angle)
+                error = float(np.mean(np.sum((mapped - target) ** 2, axis=1)))
+                key = tuple(int(index) for index in indices)
+                if key not in ranked or error < ranked[key]:
+                    ranked[key] = error
+    candidates = [
+        (error, np.asarray(indices, dtype=np.int32))
+        for indices, error in ranked.items()
+    ]
+    candidates.sort(key=lambda item: item[0])
+    if limit is not None:
+        candidates = candidates[:max(0, int(limit))]
+    return candidates
+
+
+def second_question_template_vertex_correspondence(piece, template_index):
+    """兼容旧调用：返回误差最低的一套模板顶点映射。"""
+    candidates = second_question_template_vertex_correspondences(
+        piece, template_index, limit=1)
+    return None if not candidates else candidates[0][1]
+
+
+def second_question_template_edge_ref(
+    vertex_map,
+    template_edge_index,
+    measured_point_count,
+    interval=(0.0, 1.0),
+):
+    """把模板边和模板方向区间换算为实测多边形边编号及区间。"""
+    template_count = len(vertex_map)
+    measured_point_count = int(measured_point_count)
+    start_index = int(vertex_map[template_edge_index % template_count])
+    end_index = int(vertex_map[(template_edge_index + 1) % template_count])
+    start_t, end_t = float(interval[0]), float(interval[1])
+    forward_span = (end_index - start_index) % measured_point_count
+    reverse_span = (start_index - end_index) % measured_point_count
+    if 1 <= forward_span <= SECOND_Q_COMPOSITE_EDGE_MAX_SPAN:
+        edge_ref = start_index if forward_span == 1 else (start_index, forward_span)
+        return edge_ref, start_t, end_t
+    if 1 <= reverse_span <= SECOND_Q_COMPOSITE_EDGE_MAX_SPAN:
+        edge_ref = end_index if reverse_span == 1 else (end_index, reverse_span)
+        return edge_ref, 1.0 - end_t, 1.0 - start_t
+    return None
+
+
+def second_question_first_template_guided_match_sets(pieces, match):
+    """由多套顶点映射生成并排序官方第一问的引导接缝组合。"""
+    if match is None or len(match.get("assignment", ())) != 4:
+        return ()
+    name_to_piece = {}
+    map_candidates = {}
+    for piece_index, template_index in enumerate(match["assignment"]):
+        name = FIRST_Q_TEMPLATES[template_index]["name"]
+        name_to_piece[name] = piece_index
+        candidates = second_question_template_vertex_correspondences(
+            pieces[piece_index],
+            template_index,
+            limit=SECOND_Q_FIRST_TEMPLATE_GUIDED_MAPS_PER_PIECE,
+        )
+        if not candidates:
+            return ()
+        map_candidates[name] = candidates
+
+    # D 简化后是三角形，其模板边 2 是 10 cm 长斜边。A、C 分别接两端。
+    seam_specs = (
+        ("A", 2, (0.0, 1.0), "B", 0, (0.0, 1.0)),
+        ("B", 2, (0.0, 1.0), "C", 0, (0.0, 1.0)),
+        ("C", 1, (0.0, 1.0), "D", 2, (0.0, 0.30)),
+        ("D", 2, (0.80, 1.0), "A", 1, (0.0, 1.0)),
+    )
+    names = ("A", "B", "C", "D")
+    ranked_sets = {}
+    candidate_lists = [map_candidates[name] for name in names]
+    for selected_maps in itertools.product(*candidate_lists):
+        mapping_error = sum(float(item[0]) for item in selected_maps)
+        vertex_maps = {
+            name: selected_maps[index][1] for index, name in enumerate(names)
+        }
+        matches = []
+        valid = True
+        for name_i, edge_i, interval_i, name_j, edge_j, interval_j in seam_specs:
+            ref_i = second_question_template_edge_ref(
+                vertex_maps[name_i], edge_i,
+                len(pieces[name_to_piece[name_i]]), interval_i)
+            ref_j = second_question_template_edge_ref(
+                vertex_maps[name_j], edge_j,
+                len(pieces[name_to_piece[name_j]]), interval_j)
+            if ref_i is None or ref_j is None:
+                valid = False
+                break
+            measured_edge_i, ia0, ia1 = ref_i
+            measured_edge_j, ja0, ja1 = ref_j
+            piece_i = name_to_piece[name_i]
+            piece_j = name_to_piece[name_j]
+            a, b, c, d = second_question_match_segments(pieces, (
+                0.0, piece_i, measured_edge_i, piece_j, measured_edge_j,
+                ia0, ia1, ja0, ja1,
+            ))
+            length_i = float(np.linalg.norm(b - a))
+            length_j = float(np.linalg.norm(d - c))
+            penalty = abs(length_i - length_j) / max(1.0, max(length_i, length_j))
+            matches.append((
+                penalty, piece_i, measured_edge_i, piece_j, measured_edge_j,
+                ia0, ia1, ja0, ja1,
+            ))
+        if not valid:
+            continue
+        match_set = tuple(matches)
+        signature = tuple(item[1:] for item in match_set)
+        rank = mapping_error + sum(float(item[0]) for item in match_set)
+        previous = ranked_sets.get(signature)
+        if previous is None or rank < previous[0]:
+            ranked_sets[signature] = (rank, match_set)
+    ordered = sorted(ranked_sets.values(), key=lambda item: item[0])
+    return tuple(
+        match_set for _rank, match_set in
+        ordered[:SECOND_Q_FIRST_TEMPLATE_GUIDED_MAX_SETS]
+    )
+
+
+def second_question_first_template_guided_matches(pieces, match):
+    """兼容旧调用：返回排名第一的官方引导接缝组合。"""
+    match_sets = second_question_first_template_guided_match_sets(pieces, match)
+    return None if not match_sets else match_sets[0]
+
+
 def second_question_congruent_rect_transforms(pieces):
     """全等矩形碎片直接摆放进目标矩形槽位,不匹配时返回 None。
 
@@ -2999,33 +3658,37 @@ def second_question_congruent_rect_transforms(pieces):
     dims = second_question_congruent_rect_dimensions(pieces)
     if dims is None:
         return None
-    rect_w_px = float(SECOND_Q_FIXED_RECT_W_CM) * (WARP_W - 1) / A4_W_CM
-    rect_h_px = float(SECOND_Q_FIXED_RECT_H_CM) * (WARP_H - 1) / A4_H_CM
+
+    long_side, short_side = float(dims[0]), float(dims[1])
     if count == 4:
-        layouts = [
-            (rect_w_px / 2, rect_h_px / 2, [
-                (0.0, 0.0), (rect_w_px / 2, 0.0),
-                (0.0, rect_h_px / 2), (rect_w_px / 2, rect_h_px / 2),
-            ]),
-            (rect_w_px / 4, rect_h_px, [
-                (index * rect_w_px / 4, 0.0) for index in range(4)
-            ]),
-        ]
+        grids = ((2, 2), (4, 1), (1, 4))
     else:
-        layouts = [
-            (rect_w_px / count, rect_h_px, [
-                (index * rect_w_px / count, 0.0) for index in range(count)
-            ]),
-        ]
+        grids = ((count, 1), (1, count))
 
-    def layout_cost(layout):
-        cell_w, cell_h, _slots = layout
-        return min(
-            abs(dims[0] - cell_w) + abs(dims[1] - cell_h),
-            abs(dims[0] - cell_h) + abs(dims[1] - cell_w),
-        )
-
-    cell_w, cell_h, slots = min(layouts, key=layout_cost)
+    fixed_w_px = float(SECOND_Q_FIXED_RECT_W_CM) * (WARP_W - 1) / A4_W_CM
+    fixed_h_px = float(SECOND_Q_FIXED_RECT_H_CM) * (WARP_H - 1) / A4_H_CM
+    fixed_dims = sorted((fixed_w_px, fixed_h_px), reverse=True)
+    layouts = []
+    for columns, rows in grids:
+        for cell_w, cell_h in ((long_side, short_side), (short_side, long_side)):
+            target_w = float(columns) * cell_w
+            target_h = float(rows) * cell_h
+            if not second_question_dimensions_in_range(target_w, target_h):
+                continue
+            slots = [
+                (float(column) * cell_w, float(row) * cell_h)
+                for row in range(rows)
+                for column in range(columns)
+            ]
+            target_dims = sorted((target_w, target_h), reverse=True)
+            preference = (
+                abs(target_dims[0] - fixed_dims[0])
+                + abs(target_dims[1] - fixed_dims[1])
+            )
+            layouts.append((preference, cell_w, cell_h, slots))
+    if not layouts:
+        return None
+    _preference, cell_w, cell_h, slots = min(layouts, key=lambda item: item[0])
     transforms = []
     for piece, slot in zip(pieces, slots):
         best = None
@@ -3046,12 +3709,20 @@ def second_question_congruent_rect_transforms(pieces):
     return transforms
 
 
+def second_question_normalize_polygon_winding(polygon):
+    """统一多边形绕向，避免混合顺/逆时针导致拼接落到接缝同一侧。"""
+    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+    if len(points) >= 3 and cv2.contourArea(points, oriented=True) < 0.0:
+        points = points[::-1].copy()
+    return points
+
+
 # 第二问求解主入口：输入检测到的碎片多边形，输出每块碎片的搬运变换、
 # 归一化矩形位置和边匹配结果。后续 attach_second_question_targets 会把它转成移动计划。
 def second_question_solve_transforms(piece_polygons, first_template_match=None):
-    pieces = [np.asarray(polygon, dtype=np.float32).reshape(-1, 2) for polygon in piece_polygons]
+    pieces = [second_question_normalize_polygon_winding(polygon) for polygon in piece_polygons]
     if not 2 <= len(pieces) <= PIECE_MAX_COUNT:
-        raise RuntimeError("SECOND Q piece count invalid")
+        print("碎片数量无效")
 
     # 全等矩形快车道:直接摆进目标槽位(布局按实测尺寸选择),跳过逐组合评分。
     fast_transforms = second_question_congruent_rect_transforms(pieces)
@@ -3059,13 +3730,35 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
         transforms = fast_transforms
         matches = ()
         cut_mode = "equal_rectangles"
-        print("SECOND Q OK mode=%s fast=congruent_rect matches=0" % cut_mode)
+        print("第二问完成: 等效矩形模式")
     else:
         candidates = second_question_candidate_matchings(pieces)
         full_count = len([match for match in candidates if tuple(match[5:]) == (0.0, 1.0, 0.0, 1.0)])
         partial_count = len(candidates) - full_count
         preferred_pairs = second_question_first_template_allowed_pairs(first_template_match)
+        guided_match_sets = second_question_first_template_guided_match_sets(
+            pieces, first_template_match) if first_template_match is not None else None
+        ring_pairs, ring_priorities = second_question_first_template_ring_priorities(
+            pieces, candidates, first_template_match) if first_template_match is not None else (None, None)
+        first_template_confident = second_question_first_template_is_confident(first_template_match)
         search_passes = []
+        if guided_match_sets:
+            guided_pairs = {
+                tuple(sorted((item[1], item[3])))
+                for match_set in guided_match_sets for item in match_set
+            }
+            search_passes.append((
+                "first_template_guided", guided_pairs, None,
+                len(guided_match_sets), False,
+            ))
+        if ring_pairs is not None:
+            search_passes.append((
+                "first_template_ring",
+                ring_pairs,
+                SECOND_Q_FIRST_TEMPLATE_RING_CANDIDATES_PER_PAIR,
+                SECOND_Q_FIRST_TEMPLATE_RING_MAX_SCORED_COMBOS,
+                False,
+            ))
         if preferred_pairs is not None:
             search_passes.append((
                 "first_template_topology",
@@ -3076,7 +3769,7 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
             ))
         search_passes.append(("auto", None, None, SECOND_Q_MAX_SCORED_COMBOS, False))
         if SECOND_Q_DEBUG_CANDIDATES:
-            print("SECOND Q PIECES ver=%s n=%d cand=%d full=%d partial=%d modes=%s" % (
+            print("第二问碎片: 版本=%s 碎片数=%d 候选=%d 完整=%d 局部=%d 模式=%s" % (
                 SECOND_Q_SOLVER_DEBUG_VERSION,
                 len(pieces),
                 len(candidates),
@@ -3092,36 +3785,59 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
         accepted = 0
         reject_stats = {}
         solve_start_ms = time.ticks_ms()
+        solve_total_start_ms = solve_start_ms
         solve_timed_out = False
+        first_template_fast_ok = False
         for cut_mode, allowed_pairs, pair_limit, max_scored, tree_only in search_passes:
             solve_timed_out = False
             mode_start_tried = tried
             mode_start_accepted = accepted
             if allowed_pairs is None:
-                print("SECOND Q MODE START %s" % cut_mode)
+                print("第二问模式开始: %s" % cut_mode)
             else:
-                print("SECOND Q MODE START %s pairs=%s" % (
+                print("第二问模式开始: %s 对=%s" % (
                     cut_mode,
                     ",".join("P%d-P%d" % pair for pair in sorted(allowed_pairs)),
                 ))
-            combo_iter = second_question_matching_sets(
-                pieces,
-                candidates,
-                cut_mode,
-                max_scored=max_scored,
-                allowed_pairs=allowed_pairs,
-                pair_candidate_limit=pair_limit,
-                tree_only=tree_only,
-            )
+            if cut_mode == "first_template_guided":
+                combo_iter = iter(guided_match_sets)
+            else:
+                combo_iter = second_question_matching_sets(
+                    pieces,
+                    candidates,
+                    cut_mode,
+                    max_scored=max_scored,
+                    allowed_pairs=allowed_pairs,
+                    pair_candidate_limit=pair_limit,
+                    tree_only=tree_only,
+                    cycle_only=cut_mode.startswith("first_template_"),
+                    candidate_priorities=(
+                        ring_priorities if cut_mode == "first_template_ring" else None
+                    ),
+                )
             enum_elapsed_ms = int(time.ticks_ms() - solve_start_ms)
-            print("SECOND Q COMBOS mode=%s max=%d enum=%dms" % (
+            print("第二问组合: 模式=%s 最大=%d 枚举=%d毫秒" % (
                 cut_mode, int(max_scored), enum_elapsed_ms))
             solve_start_ms = time.ticks_ms()
+            auto_geometry_heap = []
+            auto_geometry_sequence = 0
+            auto_geometry_reject_stats = {}
+            auto_coarse_heap = []
+            auto_coarse_sequence = 0
+            auto_coarse_reject_stats = {}
             for matches in combo_iter:
                 tried += 1
+                # 被硬规则拒绝的候选也必须计时，避免 accepted=0 时无限运行。
+                if (
+                    SECOND_Q_SOLVE_TIME_LIMIT_MS > 0
+                    and time.ticks_ms() - solve_total_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
+                ):
+                    print("第二问总超时: 模式=%s 已试=%d 已接受=%d" % (cut_mode, tried, accepted))
+                    solve_timed_out = True
+                    break
                 if SECOND_Q_SOLVE_PROGRESS_INTERVAL > 0 and tried % SECOND_Q_SOLVE_PROGRESS_INTERVAL == 0:
                     print(
-                        "SECOND Q SOLVING mode=%s tried=%d accepted=%d best=%s"
+                        "第二问求解: 模式=%s 已试=%d 已接受=%d 最佳=%s"
                         % (
                             cut_mode,
                             tried,
@@ -3131,13 +3847,74 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
                     )
                     if (
                         SECOND_Q_SOLVE_TIME_LIMIT_MS > 0
-                        and time.ticks_ms() - solve_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
+                        and time.ticks_ms() - solve_total_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
                     ):
-                        print("SECOND Q TIMEOUT mode=%s tried=%d accepted=%d" % (cut_mode, tried, accepted))
+                        print("第二问超时: 模式=%s 已试=%d 已接受=%d" % (cut_mode, tried, accepted))
                         solve_timed_out = True
                         break
-                result = second_question_assemble_from_matches(pieces, matches, reject_stats)
+                if cut_mode == "auto" and len(pieces) == 2:
+                    # 两片题候选很少，直接使用完整矩形评分。粗几何预筛主要为
+                    # 四片数千组合提速，可能误杀凹凸折线接缝，且在这里没有收益。
+                    result = second_question_assemble_from_matches(
+                        pieces,
+                        matches,
+                        reject_stats,
+                        optimize_cycle=False,
+                        use_fixed_rect_score=False,
+                    )
+                elif cut_mode == "auto":
+                    result = second_question_assemble_from_matches(
+                        pieces,
+                        matches,
+                        auto_geometry_reject_stats,
+                        optimize_cycle=False,
+                        use_fixed_rect_score=False,
+                        coarse_score=True,
+                        geometry_score=True,
+                    )
+                else:
+                    result = second_question_assemble_from_matches(
+                        pieces,
+                        matches,
+                        reject_stats,
+                        optimize_cycle=cut_mode.startswith("first_template_"),
+                        use_fixed_rect_score=cut_mode.startswith("first_template_"),
+                    )
                 if result is None:
+                    continue
+                if cut_mode == "auto" and len(pieces) == 2:
+                    if not second_question_candidate_clearance_ok(
+                        result, matches, reject_stats, strict_gap=False):
+                        continue
+                    accepted += 1
+                    if best is None or result[0] < best[0]:
+                        best = (result[0], result[1], result[2], matches, cut_mode, result[3])
+                    top_candidates.append((result[0], cut_mode, matches, result[3]))
+                    top_candidates.sort(key=lambda item: item[0])
+                    if len(top_candidates) > SECOND_Q_DEBUG_TOP_N:
+                        top_candidates.pop()
+                    continue
+                if cut_mode == "auto":
+                    geometry_entry = (
+                        -float(result[0]),
+                        auto_geometry_sequence,
+                        matches,
+                        result[1],
+                        result[2],
+                        float(result[3].get("closure", 0.0)),
+                    )
+                    auto_geometry_sequence += 1
+                    if len(auto_geometry_heap) < SECOND_Q_AUTO_GEOMETRY_FINALISTS:
+                        heapq.heappush(auto_geometry_heap, geometry_entry)
+                    elif geometry_entry > auto_geometry_heap[0]:
+                        heapq.heapreplace(auto_geometry_heap, geometry_entry)
+                    continue
+                if not second_question_candidate_clearance_ok(
+                    result,
+                    matches,
+                    reject_stats,
+                    strict_gap=cut_mode.startswith("first_template_"),
+                ):
                     continue
                 accepted += 1
                 if best is None or result[0] < best[0]:
@@ -3146,25 +3923,142 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
                 top_candidates.sort(key=lambda item: item[0])
                 if len(top_candidates) > SECOND_Q_DEBUG_TOP_N:
                     top_candidates.pop()
+                if cut_mode.startswith("first_template_") and first_template_confident:
+                    detail = result[3]
+                    piece_area = max(1.0, sum(
+                        abs(float(cv2.contourArea(np.asarray(polygon, dtype=np.float32))))
+                        for polygon in result[2]
+                    ))
+                    geometric_overlap = second_question_pairwise_overlap_area(result[2])
+                    overlap_ratio = geometric_overlap / piece_area
+                    if (
+                        float(detail.get("fill", 0.0)) >= SECOND_Q_FIRST_TEMPLATE_EARLY_FILL
+                        and overlap_ratio <= SECOND_Q_FIRST_TEMPLATE_EARLY_OVERLAP_RATIO
+                        and float(detail.get("boundary_cover", 1.0))
+                        <= SECOND_Q_FIRST_TEMPLATE_EARLY_MAX_BOUNDARY_MISSING
+                    ):
+                        first_template_fast_ok = True
+                        print(
+                            "SECOND Q FIRST TEMPLATE FAST OK fill=%.3f overlap=%.3f boundary=%.3f tried=%d"
+                            % (
+                                float(detail.get("fill", 0.0)),
+                                overlap_ratio,
+                                float(detail.get("boundary_cover", 1.0)),
+                                tried,
+                            )
+                        )
+                        break
                 if (
                     SECOND_Q_SOLVE_TIME_LIMIT_MS > 0
-                    and time.ticks_ms() - solve_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
+                    and time.ticks_ms() - solve_total_start_ms > SECOND_Q_SOLVE_TIME_LIMIT_MS
                 ):
-                    print("SECOND Q TIMEOUT mode=%s tried=%d accepted=%d" % (cut_mode, tried, accepted))
+                    print("第二问超时: 模式=%s 已试=%d 已接受=%d" % (cut_mode, tried, accepted))
                     solve_timed_out = True
                     break
+            if cut_mode == "auto" and auto_geometry_heap:
+                geometry_elapsed_ms = int(time.ticks_ms() - solve_start_ms)
+                geometry_finalists = sorted(
+                    auto_geometry_heap, key=lambda item: (-item[0], item[1]))
+                print(
+                    "第二问几何预筛结束: 保留=%d 拒绝=%s 耗时=%d毫秒"
+                    % (
+                        len(geometry_finalists),
+                        second_question_format_reject_stats(auto_geometry_reject_stats),
+                        geometry_elapsed_ms,
+                    )
+                )
+                coarse_start_ms = time.ticks_ms()
+                for _neg_score, _sequence, matches, transforms, assembled, closure_error in geometry_finalists:
+                    result = second_question_score_assembly(
+                        transforms,
+                        assembled,
+                        matches,
+                        closure_error,
+                        auto_coarse_reject_stats,
+                        apply_rectlike_reject=False,
+                        use_fixed_rect_score=False,
+                        mask_scale=SECOND_Q_AUTO_COARSE_MASK_SCALE,
+                        coarse_score=True,
+                    )
+                    if result is None:
+                        continue
+                    coarse_entry = (
+                        -float(result[0]),
+                        auto_coarse_sequence,
+                        matches,
+                        result[1],
+                        result[2],
+                        float(result[3].get("closure", 0.0)),
+                    )
+                    auto_coarse_sequence += 1
+                    if len(auto_coarse_heap) < SECOND_Q_AUTO_FINALISTS:
+                        heapq.heappush(auto_coarse_heap, coarse_entry)
+                    elif coarse_entry > auto_coarse_heap[0]:
+                        heapq.heapreplace(auto_coarse_heap, coarse_entry)
+
+            if cut_mode == "auto" and len(pieces) > 2 and not auto_geometry_heap:
+                for reason, count in auto_geometry_reject_stats.items():
+                    reject_stats[reason] = reject_stats.get(reason, 0) + count
+                print(
+                    "第二问几何预筛无候选: 拒绝=%s"
+                    % second_question_format_reject_stats(auto_geometry_reject_stats)
+                )
+
+            if cut_mode == "auto" and auto_coarse_heap:
+                coarse_elapsed_ms = int(time.ticks_ms() - coarse_start_ms)
+                finalists = sorted(auto_coarse_heap, key=lambda item: (-item[0], item[1]))
+                print(
+                    "第二问粗筛结束: 保留=%d 拒绝=%s 耗时=%d毫秒"
+                    % (
+                        len(finalists),
+                        second_question_format_reject_stats(auto_coarse_reject_stats),
+                        coarse_elapsed_ms,
+                    )
+                )
+                final_start_ms = time.ticks_ms()
+                for _neg_score, _sequence, matches, transforms, assembled, closure_error in finalists:
+                    result = second_question_score_assembly(
+                        transforms,
+                        assembled,
+                        matches,
+                        closure_error,
+                        reject_stats,
+                        use_fixed_rect_score=False,
+                    )
+                    if result is None:
+                        continue
+                    if not second_question_candidate_clearance_ok(
+                        result, matches, reject_stats, strict_gap=False):
+                        continue
+                    accepted += 1
+                    if best is None or result[0] < best[0]:
+                        best = (result[0], result[1], result[2], matches, cut_mode, result[3])
+                    top_candidates.append((result[0], cut_mode, matches, result[3]))
+                    top_candidates.sort(key=lambda item: item[0])
+                    if len(top_candidates) > SECOND_Q_DEBUG_TOP_N:
+                        top_candidates.pop()
+                print(
+                    "第二问精评结束: 候选=%d 接受=%d 耗时=%d毫秒"
+                    % (
+                        len(finalists),
+                        accepted - mode_start_accepted,
+                        int(time.ticks_ms() - final_start_ms),
+                    )
+                )
             elapsed_ms = time.ticks_ms() - solve_start_ms
             print(
-                "SECOND Q MODE END %s tried=%d accepted=%d elapsed=%dms"
+                "第二问模式结束: %s 已试=%d 已接受=%d 耗时=%d毫秒"
                 % (cut_mode, tried - mode_start_tried, accepted - mode_start_accepted, int(elapsed_ms))
             )
-            if best is not None and allowed_pairs is not None:
-                print("SECOND Q FIRST TEMPLATE TOPOLOGY OK; skip auto fallback")
+            if cut_mode.startswith("first_template_"):
+                if first_template_fast_ok:
+                    print("第一问模板高置信拓扑成功; 跳过自动回退")
+                    break
+                print("第一问模板快路未达到高质量门槛; 继续通用回退")
+            if solve_timed_out:
                 break
-            if best is None and allowed_pairs is not None:
-                print("SECOND Q FIRST TEMPLATE TOPOLOGY FAIL; fallback auto")
         if best is None:
-            raise RuntimeError("SECOND Q solve failed mode=%s cand=%d full=%d partial=%d tried=%d accepted=%d reject=%s" % (
+            raise RuntimeError("第二问求解失败: 模式=%s 候选=%d 完整=%d 局部=%d 已试=%d 已接受=%d 拒绝原因=%s" % (
                 SECOND_Q_CUT_MODE,
                 len(candidates),
                 full_count,
@@ -3177,9 +4071,7 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
         second_question_print_top_candidates(top_candidates)
 
         _score, transforms, _assembled, matches, cut_mode, _detail = best
-        if len(matches) >= len(pieces):
-            transforms = second_question_optimize_pose_graph(pieces, matches, transforms)
-        print("SECOND Q OK mode=%s score=%.1f matches=%d tried=%d accepted=%d" % (
+        print("第二问完成: 模式=%s 分数=%.1f 匹配=%d 已试=%d 已接受=%d" % (
             cut_mode,
             float(_score),
             len(matches),
@@ -3216,17 +4108,203 @@ def second_question_solve_transforms(piece_polygons, first_template_match=None):
     return transforms, normalize, min_point, target_size, target_rect, matches
 
 
+def second_question_geometric_contact_normals(polygon_i, polygon_j, center_delta):
+    """从最终几何轮廓中找出两片之间全部近共线接缝法线。"""
+    polygon_i = np.asarray(polygon_i, dtype=np.float32).reshape(-1, 2)
+    polygon_j = np.asarray(polygon_j, dtype=np.float32).reshape(-1, 2)
+    candidates = []
+    for edge_i_start, edge_i_end in polygon_edges(polygon_i):
+        tangent_i = np.asarray(edge_i_end - edge_i_start, dtype=np.float32)
+        length_i = float(np.linalg.norm(tangent_i))
+        if length_i <= 1e-6:
+            continue
+        tangent_i /= length_i
+        normal_i = np.asarray([-tangent_i[1], tangent_i[0]], dtype=np.float32)
+        midpoint_i = 0.5 * (edge_i_start + edge_i_end)
+        projection_i = sorted((
+            float(np.dot(edge_i_start, tangent_i)),
+            float(np.dot(edge_i_end, tangent_i)),
+        ))
+        for edge_j_start, edge_j_end in polygon_edges(polygon_j):
+            tangent_j = np.asarray(edge_j_end - edge_j_start, dtype=np.float32)
+            length_j = float(np.linalg.norm(tangent_j))
+            if length_j <= 1e-6:
+                continue
+            tangent_j /= length_j
+            parallel = abs(float(np.dot(tangent_i, tangent_j)))
+            if parallel < SECOND_Q_CLEARANCE_CONTACT_PARALLEL_MIN:
+                continue
+            projection_j = sorted((
+                float(np.dot(edge_j_start, tangent_i)),
+                float(np.dot(edge_j_end, tangent_i)),
+            ))
+            overlap = min(projection_i[1], projection_j[1]) - max(
+                projection_i[0], projection_j[0])
+            if overlap < SECOND_Q_CLEARANCE_CONTACT_OVERLAP_PX:
+                continue
+            midpoint_j = 0.5 * (edge_j_start + edge_j_end)
+            line_distance = abs(float(np.dot(midpoint_j - midpoint_i, normal_i)))
+            if line_distance > SECOND_Q_CLEARANCE_CONTACT_DISTANCE_PX:
+                continue
+            normal = normal_i.copy()
+            if float(np.dot(normal, center_delta)) < 0.0:
+                normal = -normal
+            candidates.append((line_distance, -overlap, -parallel, normal))
+
+    candidates.sort(key=lambda item: item[:3])
+    normals = []
+    for _distance, _overlap, _parallel, normal in candidates:
+        if any(float(np.dot(normal, previous)) >= 0.985 for previous in normals):
+            continue
+        normals.append(normal)
+        if len(normals) >= 3:
+            break
+    return normals
+
+
+def second_question_clearance_pair_normals(assembled, matches):
+    """返回全部实际接缝约束；同一碎片对可保留多个折线法线。"""
+    polygons = [np.asarray(polygon, dtype=np.float32).reshape(-1, 2) for polygon in assembled]
+    centers = [np.mean(polygon, axis=0) for polygon in polygons]
+    pair_normals = {}
+
+    def add_normal(key, normal):
+        normal = np.asarray(normal, dtype=np.float32)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm <= 1e-6:
+            return
+        normal /= normal_norm
+        center_delta = centers[key[1]] - centers[key[0]]
+        if float(np.dot(normal, center_delta)) < 0.0:
+            normal = -normal
+        normals = pair_normals.setdefault(key, [])
+        if any(float(np.dot(normal, previous)) >= 0.985 for previous in normals):
+            return
+        normals.append(normal)
+
+    for match in matches or ():
+        _, piece_i, edge_i, piece_j, _edge_j = match[:5]
+        key = tuple(sorted((int(piece_i), int(piece_j))))
+        edge_start, edge_end = second_question_resolve_edge(polygons[piece_i], edge_i)
+        tangent = np.asarray(edge_end - edge_start, dtype=np.float32)
+        tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm <= 1e-6:
+            continue
+        normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32) / tangent_norm
+        add_normal(key, normal)
+
+    # 树形求解只声明 N-1 条边，但最终矩形里可能存在额外闭环接触；
+    # 同一对凹凸碎片也可能共享两段非共线折线，必须逐段加入约束。
+    for piece_i, piece_j in itertools.combinations(range(len(polygons)), 2):
+        key = (piece_i, piece_j)
+        center_delta = centers[piece_j] - centers[piece_i]
+        for normal in second_question_geometric_contact_normals(
+            polygons[piece_i], polygons[piece_j], center_delta):
+            add_normal(key, normal)
+
+    if pair_normals:
+        return [
+            (key[0], key[1], normal)
+            for key, normals in sorted(pair_normals.items())
+            for normal in normals
+        ]
+
+    # 等分矩形快车道没有显式 matches；用中心距离最小生成树分离所有行列。
+    edges = []
+    for piece_i, piece_j in itertools.combinations(range(len(polygons)), 2):
+        delta = centers[piece_j] - centers[piece_i]
+        length = float(np.linalg.norm(delta))
+        if length > 1e-6:
+            edges.append((length, piece_i, piece_j, delta / length))
+    edges.sort(key=lambda item: item[0])
+    parent = list(range(len(polygons)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    result = []
+    for _length, piece_i, piece_j, normal in edges:
+        root_i = find(piece_i)
+        root_j = find(piece_j)
+        if root_i == root_j:
+            continue
+        parent[root_j] = root_i
+        result.append((piece_i, piece_j, normal))
+        if len(result) >= len(polygons) - 1:
+            break
+    return result
+
+
+def second_question_clearance_offsets(assembled, matches, gap_px):
+    """迭代投影求平移量，使每条已匹配接缝沿法线至少分开固定距离。"""
+    count = len(assembled)
+    pairs = second_question_clearance_pair_normals(assembled, matches)
+    if count <= 1 or not pairs or gap_px <= 0.0:
+        return np.zeros((count, 2), dtype=np.float32)
+
+    offsets = np.zeros((count, 2), dtype=np.float32)
+    tolerance = 0.01
+    for _iteration in range(40):
+        max_deficit = 0.0
+        for piece_i, piece_j, normal in pairs:
+            projected_gap = float(np.dot(offsets[piece_j] - offsets[piece_i], normal))
+            deficit = float(gap_px) - projected_gap
+            if deficit <= tolerance:
+                continue
+            correction = np.asarray(normal, dtype=np.float32) * (0.5 * deficit)
+            offsets[piece_i] -= correction
+            offsets[piece_j] += correction
+            max_deficit = max(max_deficit, deficit)
+        offsets -= np.mean(offsets, axis=0, keepdims=True)
+        if max_deficit <= tolerance:
+            break
+    offsets -= np.mean(offsets, axis=0, keepdims=True)
+    return offsets
+
+
+def second_question_clearance_achieved_gap(assembled, matches, offsets):
+    pairs = second_question_clearance_pair_normals(assembled, matches)
+    if not pairs:
+        return 0.0
+    return max(0.0, min(
+        float(np.dot(offsets[piece_j] - offsets[piece_i], normal))
+        for piece_i, piece_j, normal in pairs
+    ))
+
+
+def second_question_apply_clearance(assembled, matches, requested_gap_px):
+    """应用固定间距；若拓扑约束冲突导致重叠，逐步缩小间距直至安全。"""
+    polygons = [np.asarray(polygon, dtype=np.float32).reshape(-1, 2) for polygon in assembled]
+    gap_px = max(0.0, float(requested_gap_px))
+    for _attempt in range(5):
+        offsets = second_question_clearance_offsets(polygons, matches, gap_px)
+        shifted = [polygon + offsets[index] for index, polygon in enumerate(polygons)]
+        overlap = second_question_pairwise_overlap_area(shifted)
+        if overlap <= 1.0:
+            achieved_gap = second_question_clearance_achieved_gap(polygons, matches, offsets)
+            return offsets, shifted, min(gap_px, achieved_gap), overlap
+        gap_px *= 0.5
+    offsets = np.zeros((len(polygons), 2), dtype=np.float32)
+    return offsets, polygons, 0.0, second_question_pairwise_overlap_area(polygons)
+
+
 def attach_second_question_targets(pieces):
     if not SECOND_QUESTION_MODE or len(pieces) < 2:
         return False
 
+    for piece in pieces:
+        normalized_polygon = second_question_normalize_polygon_winding(piece.get("polygon", []))
+        piece["polygon"] = normalized_polygon.tolist()
     first_template_match = second_question_first_template_match(pieces)
     if first_template_match is not None:
         summary = []
         for piece_index, template_index in enumerate(first_template_match["assignment"]):
             summary.append("P%d=%s" % (piece_index, FIRST_Q_TEMPLATES[template_index]["name"]))
         print(
-            "SECOND Q DETECT FIRST TEMPLATE cost=%.3f max_shape=%.3f try=template_topology %s"
+            "第二问检测到第一问模板: 成本=%.3f 最大形状分=%.3f 碎片分配=%s"
             % (
                 float(first_template_match["cost"]),
                 float(first_template_match["max_shape_score"]),
@@ -3242,50 +4320,81 @@ def attach_second_question_targets(pieces):
             first_template_match=first_template_match,
         )
     except Exception as err:
-        print("SECOND Q SOLVE FAIL %s" % err)
+        print("第二问求解失败: %s" % err)
         return False
 
     target_size = np.asarray(target_size, dtype=np.float32)
     min_point = np.asarray(min_point, dtype=np.float32)
-    requested_scale = float(PIECE_TARGET_SHAPE_EXPAND_SCALE)
-    available_size = second_question_target_available_size(target_side)
-    fit_scale = min(
-        requested_scale,
-        float(available_size[0]) / max(1.0, float(target_size[0])),
-        float(available_size[1]) / max(1.0, float(target_size[1])),
+
+    # 求解和矩形验收保持真实尺寸；这里只为机械放置增加固定毫米安全间距。
+    normalized_transforms = [normalize.dot(transform) for transform in transforms]
+    normalized_polygons = [
+        apply_homography_points(np.asarray(piece.get("polygon", []), dtype=np.float32), transform)
+        for piece, transform in zip(pieces, normalized_transforms)
+    ]
+    px_per_mm = 0.5 * (
+        (WARP_W - 1.0) / A4_W_MM
+        + (WARP_H - 1.0) / A4_H_MM
     )
-    expand_scale = max(0.1, fit_scale)
-    if expand_scale < requested_scale - 1e-3:
+    requested_gap_px = float(SECOND_Q_TARGET_GAP_MM) * px_per_mm
+    clearance_constraint_count = len(
+        second_question_clearance_pair_normals(normalized_polygons, _matches))
+    clearance_offsets, clearance_polygons, actual_gap_px, clearance_overlap = second_question_apply_clearance(
+        normalized_polygons,
+        _matches,
+        requested_gap_px,
+    )
+    clearance_points = np.vstack(clearance_polygons).astype(np.float32)
+    clearance_min = clearance_points.min(axis=0)
+    clearance_max = clearance_points.max(axis=0)
+    clearance_size = np.maximum(1.0, clearance_max - clearance_min)
+    available_size = second_question_target_available_size(target_side)
+    if np.any(clearance_size > available_size + 1e-3):
         print(
-            "SECOND Q PREVIEW scale=%.2f requested=%.2f capped_by_fit size=%.0fx%.0f avail=%.0fx%.0f"
+            "SECOND Q GAP DISABLED no_space size=%.0fx%.0f avail=%.0fx%.0f"
             % (
-                float(expand_scale),
-                float(requested_scale),
-                float(target_size[0]),
-                float(target_size[1]),
+                float(clearance_size[0]),
+                float(clearance_size[1]),
                 float(available_size[0]),
                 float(available_size[1]),
             )
         )
-    target_center = min_point + target_size * 0.5
-    expand_transform = np.array(
-        [
-            [expand_scale, 0.0, target_center[0] * (1.0 - expand_scale)],
-            [0.0, expand_scale, target_center[1] * (1.0 - expand_scale)],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
+        clearance_offsets = np.zeros((len(pieces), 2), dtype=np.float32)
+        clearance_polygons = normalized_polygons
+        actual_gap_px = 0.0
+        clearance_overlap = second_question_pairwise_overlap_area(clearance_polygons)
+        clearance_points = np.vstack(clearance_polygons).astype(np.float32)
+        clearance_min = clearance_points.min(axis=0)
+        clearance_max = clearance_points.max(axis=0)
+        clearance_size = np.maximum(1.0, clearance_max - clearance_min)
+
+    target_origin = second_question_target_origin(target_side, clearance_size)
+    translate = rigid_transform(
+        0.0,
+        float(target_origin[0] - clearance_min[0]),
+        float(target_origin[1] - clearance_min[1]),
     )
-    expanded_min = target_center + (min_point - target_center) * expand_scale
-    expanded_size = target_size * expand_scale
-    target_origin = second_question_target_origin(target_side, expanded_size)
     target_rect_points = np.asarray(target_rect_points, dtype=np.float32).reshape(-1, 2)
-    expanded_rect = target_center.reshape(1, 2) + (target_rect_points - target_center.reshape(1, 2)) * expand_scale
-    target_rect = np.rint(expanded_rect + (target_origin - expanded_min).reshape(1, 2)).astype(np.int32).tolist()
-    translate = rigid_transform(0.0, float(target_origin[0] - expanded_min[0]), float(target_origin[1] - expanded_min[1]))
+    target_rect = np.rint(
+        target_rect_points + (target_origin - clearance_min).reshape(1, 2)
+    ).astype(np.int32).tolist()
+    print(
+        "SECOND Q GAP requested=%.1fmm actual=%.1fmm overlap=%.1f constraints=%d"
+        % (
+            float(SECOND_Q_TARGET_GAP_MM),
+            float(actual_gap_px / max(1e-6, px_per_mm)),
+            float(clearance_overlap),
+            int(clearance_constraint_count),
+        )
+    )
 
     for piece_index, piece in enumerate(pieces):
-        transform = translate.dot(expand_transform).dot(normalize).dot(transforms[piece_index])
+        offset_transform = rigid_transform(
+            0.0,
+            float(clearance_offsets[piece_index][0]),
+            float(clearance_offsets[piece_index][1]),
+        )
+        transform = translate.dot(offset_transform).dot(normalized_transforms[piece_index])
         polygon = np.asarray(piece.get("polygon", []), dtype=np.float32).reshape(-1, 2)
         target_polygon = apply_homography_points(polygon, transform)
         current_center = np.asarray(piece.get("center", polygon_center(polygon)), dtype=np.float32).reshape(1, 2)
@@ -3297,7 +4406,7 @@ def attach_second_question_targets(pieces):
         piece["id"] = piece_index
         piece["template"] = piece_name
         piece["target_side"] = target_side
-        piece["target_size"] = [float(expanded_size[0]), float(expanded_size[1])]
+        piece["target_size"] = [float(clearance_size[0]), float(clearance_size[1])]
         piece["target_polygon"] = target_rect
         piece["target_center"] = target_center_list
         piece["target_detected_polygon"] = target_polygon_list
@@ -3305,13 +4414,13 @@ def attach_second_question_targets(pieces):
         piece["final_center"] = target_center_list
         piece["final_detected_polygon"] = target_polygon_list
         piece["rotate_deg"] = round(rotate_deg, 1)
-        piece["rotate_method"] = "q2"
+        piece["rotate_method"] = "q2_gap_mm"
         piece["move"] = {
             "pick": piece.get("center", [0, 0]),
             "place": target_center_list,
             "final_place": target_center_list,
             "rotate_deg": round(rotate_deg, 1),
-            "rotate_method": "q2",
+            "rotate_method": "q2_gap_mm",
         }
     return True
 
@@ -3320,21 +4429,77 @@ def attach_second_question_targets(pieces):
 # Move Planning and Capture Aggregation
 # =========================
 # 把第一/第二问求解结果转换为机械端需要的抓取点、放置点和旋转角。
+def mech_mm_offset_to_warp_pixels(offset_x_mm, offset_y_mm):
+    """把沿 A4 标准透视图方向的毫米补偿转换为像素。"""
+    return np.asarray([
+        float(offset_x_mm) * (WARP_W - 1.0) / A4_W_MM,
+        float(offset_y_mm) * (WARP_H - 1.0) / A4_H_MM,
+    ], dtype=np.float32)
+
+
+def compensate_global_mech_mapping(point):
+    """统一修正视觉坐标到 STM32 坐标的比例、旋转和原点偏差。"""
+    point = np.asarray(point, dtype=np.float32)
+    center = np.asarray([
+        (WARP_W - 1.0) * 0.5,
+        (WARP_H - 1.0) * 0.5,
+    ], dtype=np.float32)
+    relative = (point - center) * np.asarray([
+        float(MECH_GLOBAL_X_SCALE),
+        float(MECH_GLOBAL_Y_SCALE),
+    ], dtype=np.float32)
+    angle_rad = math.radians(float(MECH_GLOBAL_ROTATION_DEG))
+    cosine = math.cos(angle_rad)
+    sine = math.sin(angle_rad)
+    corrected = center + np.asarray([
+        cosine * float(relative[0]) - sine * float(relative[1]),
+        sine * float(relative[0]) + cosine * float(relative[1]),
+    ], dtype=np.float32)
+    corrected += mech_mm_offset_to_warp_pixels(
+        MECH_GLOBAL_FIXED_OFFSET_X_MM,
+        MECH_GLOBAL_FIXED_OFFSET_Y_MM,
+    )
+    corrected[0] = np.clip(corrected[0], 0.0, WARP_W - 1.0)
+    corrected[1] = np.clip(corrected[1], 0.0, WARP_H - 1.0)
+    return corrected
+
+
 def build_move_plan(pieces):
-    plan = []
+    pending = []
     for piece in pieces:
         move = piece.get("move")
         if not move:
             continue
         pick = move["pick"]
         place = move.get("final_place", move["place"])
+        pending.append((piece, move, pick, place))
+
+    pick_fixed_offset = mech_mm_offset_to_warp_pixels(
+        MECH_PICK_FIXED_OFFSET_X_MM,
+        MECH_PICK_FIXED_OFFSET_Y_MM,
+    )
+    place_fixed_offset = mech_mm_offset_to_warp_pixels(
+        MECH_PLACE_FIXED_OFFSET_X_MM,
+        MECH_PLACE_FIXED_OFFSET_Y_MM,
+    )
+
+    plan = []
+    for piece, move, pick, place in pending:
+        pick_for_output = compensate_global_mech_mapping(pick) + pick_fixed_offset
+        pick_for_output[0] = np.clip(pick_for_output[0], 0.0, WARP_W - 1.0)
+        pick_for_output[1] = np.clip(pick_for_output[1], 0.0, WARP_H - 1.0)
+
+        place_for_output = compensate_global_mech_mapping(place) + place_fixed_offset
+
         plan.append({
             "piece": piece.get("template", "?"),
             "pick": pick,
             "place": move["place"],
             "final_place": place,
-            "pick_mech": warp_to_mech_point(pick),
-            "place_mech": warp_to_mech_point(place),
+            "pick_mech": warp_to_mech_point(pick_for_output),
+            "place_mech": warp_to_mech_point(place_for_output),
+            "pick_output_warp": np.asarray(pick_for_output, dtype=np.float32).tolist(),
+            "place_output_warp": np.asarray(place_for_output, dtype=np.float32).tolist(),
             "rotate_deg": move["rotate_deg"],
             "rotate_method": move.get("rotate_method", "?"),
             "target_side": piece.get("target_side", "?"),
@@ -3380,6 +4545,7 @@ def aggregate_capture_samples(samples):
     result = {
         "status": True,
         "stable": True,
+        "a4_method": capture_a4_method(valid_samples),
         "corners": corners,
         "midline": standard_midline(),
         "pieces_count": len(aggregated_pieces),
@@ -3405,24 +4571,36 @@ def aggregate_second_question_capture_samples(valid_samples):
         for sample in valid_samples:
             piece_count = len(sample.get("pieces", []))
             observed[piece_count] = observed.get(piece_count, 0) + 1
-        print("SECOND Q FAIL piece_count_hist=%s need=2..%d" % (observed, PIECE_MAX_COUNT))
+        print("第二问失败: 碎片数量分布=%s 需要=2..%d" % (observed, PIECE_MAX_COUNT))
         return None, []
     expected_count = max(count_histogram.items(), key=lambda item: item[1])[0]
     samples = [sample for sample in valid_samples if len(sample.get("pieces", [])) == expected_count]
+    print("第二问捕获分布=%s 采用=%d 帧=%d" % (
+        count_histogram, expected_count, len(samples)))
     if len(samples) < CAPTURE_MIN_VALID_FRAMES:
-        print("SECOND Q FAIL stable_count=%d frames=%d" % (expected_count, len(samples)))
+        print("第二问失败: 稳定帧数=%d 总帧数=%d" % (expected_count, len(samples)))
         return None, []
 
-    base_pieces = sorted(samples[0].get("pieces", []), key=lambda piece: (piece["center"][1], piece["center"][0]))
+    base_sample = choose_capture_medoid_sample(samples)
+    base_pieces = sorted(
+        base_sample.get("pieces", []),
+        key=lambda piece: (piece["center"][1], piece["center"][0]),
+    )
     grouped = [[base_piece] for base_piece in base_pieces]
     base_centers = [np.asarray(piece["center"], dtype=np.float32) for piece in base_pieces]
-    for sample in samples[1:]:
+    matched_samples = 1
+    for sample in samples:
+        if sample is base_sample:
+            continue
         pieces = sorted(sample.get("pieces", []), key=lambda piece: (piece["center"][1], piece["center"][0]))
         order = best_piece_order_by_center(base_centers, pieces)
         if order is None:
             continue
+        matched_samples += 1
         for group_index, piece_index in enumerate(order):
             grouped[group_index].append(pieces[piece_index])
+    print("第二问聚合配对: 匹配帧=%d/%d 分组=%s" % (
+        matched_samples, len(samples), [len(group) for group in grouped]))
 
     aggregated_pieces = []
     for piece_index, group in enumerate(grouped):
@@ -3434,16 +4612,17 @@ def aggregate_second_question_capture_samples(valid_samples):
         aggregated_pieces.append(average_second_question_piece_samples(piece_index, filtered))
 
     if len(aggregated_pieces) != expected_count:
-        print("SECOND Q FAIL aggregated=%d expected=%d" % (len(aggregated_pieces), expected_count))
+        print("第二问失败: 聚合碎片数=%d 期望=%d" % (len(aggregated_pieces), expected_count))
         return None, []
     if not attach_second_question_targets(aggregated_pieces):
-        print("SECOND Q FAIL solve pieces=%d" % len(aggregated_pieces))
+        print("第二问失败: 求解碎片数=%d" % len(aggregated_pieces))
         return None, []
 
     corners = average_a4_corners(samples)
     result = {
         "status": True,
         "stable": True,
+        "a4_method": capture_a4_method(samples),
         "question_mode": QUESTION_MODE,
         "corners": corners,
         "midline": standard_midline(),
@@ -3459,22 +4638,54 @@ def aggregate_second_question_capture_samples(valid_samples):
     return result, piece_contours
 
 
+def capture_a4_method(samples):
+    counts = {}
+    for sample in samples:
+        method = sample.get("a4_method", "unknown")
+        counts[method] = counts.get(method, 0) + 1
+    if not counts:
+        return "unknown"
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
 def best_piece_order_by_center(base_centers, pieces):
     if len(base_centers) != len(pieces):
         return None
-    centers = [np.asarray(piece["center"], dtype=np.float32) for piece in pieces]
+    base = np.asarray(base_centers, dtype=np.float32).reshape(-1, 2)
+    centers = np.asarray(
+        [piece["center"] for piece in pieces], dtype=np.float32).reshape(-1, 2)
+    base_centered = base - np.mean(base, axis=0, keepdims=True)
+    centers_centered = centers - np.mean(centers, axis=0, keepdims=True)
     best_order = None
     best_error = None
     for order in itertools.permutations(range(len(pieces))):
-        error = 0.0
-        for base_index, piece_index in enumerate(order):
-            error += float(np.linalg.norm(base_centers[base_index] - centers[piece_index]))
+        ordered = centers_centered[np.asarray(order, dtype=np.int32)]
+        error = float(np.sum(np.linalg.norm(base_centered - ordered, axis=1)))
         if best_error is None or error < best_error:
             best_error = error
             best_order = order
     if best_error is not None and best_error > CAPTURE_OUTLIER_CENTER_PX * len(pieces):
         return None
     return best_order
+
+
+def choose_capture_medoid_sample(samples):
+    """选择最接近全部有效帧中位布局的基准帧，避免首帧异常拖垮聚合。"""
+    if len(samples) <= 1:
+        return samples[0]
+    signatures = []
+    for sample in samples:
+        centers = np.asarray(
+            [piece.get("center", [0, 0]) for piece in sample.get("pieces", [])],
+            dtype=np.float32,
+        ).reshape(-1, 2)
+        order = np.lexsort((centers[:, 0], centers[:, 1]))
+        centers = centers[order]
+        signatures.append(centers - np.mean(centers, axis=0, keepdims=True))
+    signature_array = np.asarray(signatures, dtype=np.float32)
+    median_signature = np.median(signature_array, axis=0)
+    errors = np.sum(np.linalg.norm(signature_array - median_signature, axis=2), axis=1)
+    return samples[int(np.argmin(errors))]
 
 
 def filter_second_question_piece_samples(pieces):
@@ -3591,12 +4802,40 @@ def average_polygon_field(pieces, field_name):
     polygons = [piece.get(field_name) for piece in pieces if piece.get(field_name)]
     if not polygons:
         return None
-    point_count = len(polygons[0])
-    if any(len(polygon) != point_count for polygon in polygons):
+
+    # 角点拟合偶尔会多/少一个点；使用出现次数最多的边数，避免单帧异常主导结果。
+    count_histogram = {}
+    for polygon in polygons:
+        count = len(polygon)
+        count_histogram[count] = count_histogram.get(count, 0) + 1
+    point_count = max(count_histogram.items(), key=lambda item: item[1])[0]
+    candidates = [
+        np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+        for polygon in polygons if len(polygon) == point_count
+    ]
+    if not candidates:
         return polygons[0]
-    points = np.asarray(polygons, dtype=np.float32)
-    mean = np.mean(points, axis=0)
-    return np.rint(mean).astype(np.int32).tolist()
+
+    # OpenCV 轮廓起点可能逐帧循环移动，绕向也可能翻转。先使用捕获中位帧作参考，
+    # 再把每帧顶点对齐到同一索引，最后逐坐标取中位数抑制抖动和离群角点。
+    def align_to_reference(reference, candidate):
+        best = None
+        for variant in (candidate, candidate[::-1]):
+            for shift in range(point_count):
+                aligned = np.roll(variant, -shift, axis=0)
+                error = float(np.mean(np.sum((aligned - reference) ** 2, axis=1)))
+                if best is None or error < best[0]:
+                    best = (error, aligned)
+        return best
+
+    # grouped[0] 来自布局中位帧，直接作为参考可避免在 MaixCAM 上做 O(n^2) 两两比较。
+    reference = candidates[0]
+    aligned_candidates = [
+        align_to_reference(reference, candidate)[1]
+        for candidate in candidates
+    ]
+    median = np.median(np.asarray(aligned_candidates, dtype=np.float32), axis=0)
+    return np.rint(median).astype(np.int32).tolist()
 
 
 def average_angles(angles):
@@ -3632,39 +4871,31 @@ def mech_calibration_matrix():
     return cv2.getPerspectiveTransform(src, dst)
 
 
-def compensate_centerline_bias(point):
-    """补偿抓取/放置都向 A4 中心偏的系统误差。"""
-    corrected = np.asarray(point, dtype=np.float32).copy()
-    if MECH_CENTERLINE_COMPENSATION_ENABLED:
-        center_x = (WARP_W - 1.0) * 0.5
-        center_y = (WARP_H - 1.0) * 0.5
-        px_per_mm_x = (WARP_W - 1.0) / A4_W_MM
-        px_per_mm_y = (WARP_H - 1.0) / A4_H_MM
-
-        dx = float(corrected[0] - center_x)
-        corrected[0] = center_x + dx * float(MECH_CENTERLINE_X_SCALE)
-        if abs(dx) > 1e-6:
-            corrected[0] += np.sign(dx) * float(MECH_CENTERLINE_X_OUTWARD_MM) * px_per_mm_x
-        corrected[0] += float(MECH_CENTERLINE_X_OFFSET_MM) * px_per_mm_x
-        corrected[0] = max(0.0, min(float(corrected[0]), WARP_W - 1.0))
-
-        dy = float(corrected[1] - center_y)
-        corrected[1] = center_y + dy * float(MECH_CENTERLINE_Y_SCALE)
-        if abs(dy) > 1e-6:
-            corrected[1] += np.sign(dy) * float(MECH_CENTERLINE_Y_OUTWARD_MM) * px_per_mm_y
-        corrected[1] += float(MECH_CENTERLINE_Y_OFFSET_MM) * px_per_mm_y
-        corrected[1] = max(0.0, min(float(corrected[1]), WARP_H - 1.0))
-    return corrected
+def mech_output_calibration_matrix():
+    """A4 标准像素直接映射到 STM32 最终输出坐标，避免轴交换标定歧义。"""
+    src = np.float32(
+        [
+            [0.0, 0.0],
+            [WARP_W - 1.0, 0.0],
+            [WARP_W - 1.0, WARP_H - 1.0],
+            [0.0, WARP_H - 1.0],
+        ]
+    )
+    return cv2.getPerspectiveTransform(
+        src, np.float32(MECH_OUTPUT_CALIBRATION_POINTS))
 
 
 def warp_to_mech_point(point):
+    corrected = np.asarray(point, dtype=np.float32)
     if not MECH_COORD_OUTPUT_ENABLED:
-        corrected = compensate_centerline_bias(point)
         return format_output_mech_point([float(corrected[0]), float(corrected[1])])
 
-    matrix = mech_calibration_matrix()
-    corrected = compensate_centerline_bias(point)
     src = np.float32([[[float(corrected[0]), float(corrected[1])]]])
+    if MECH_DIRECT_OUTPUT_CALIBRATION_ENABLED:
+        dst = cv2.perspectiveTransform(src, mech_output_calibration_matrix())[0][0]
+        return [float(dst[0]), float(dst[1])]
+
+    matrix = mech_calibration_matrix()
     dst = cv2.perspectiveTransform(src, matrix)[0][0]
     return format_output_mech_point([float(dst[0]), float(dst[1])])
 
@@ -3720,6 +4951,11 @@ def move_plan_records(result):
             {
                 "name": piece_name,
                 "id": piece_name_to_id(piece_name),
+                "pick_warp": move.get("pick", [0, 0]),
+                "place_warp": move.get("final_place", move.get("place", [0, 0])),
+                "pick_output_warp": move.get("pick_output_warp", move.get("pick", [0, 0])),
+                "place_output_warp": move.get(
+                    "place_output_warp", move.get("final_place", move.get("place", [0, 0]))),
                 "pick_x": int(round(float(pick_x))),
                 "pick_y": int(round(float(pick_y))),
                 "place_x": int(round(float(place_x))),
@@ -3836,10 +5072,22 @@ def build_move_packet_log(result):
 
     parts = ["MOVES %d" % len(records)]
     for record in records:
+        pick_warp = record["pick_warp"]
+        pick_output_warp = record["pick_output_warp"]
+        place_warp = record["place_warp"]
+        place_output_warp = record["place_output_warp"]
         parts.append(
-            "%s pick=(%d,%d) place=(%d,%d) rot=%.1f/%s"
+            "%s pick_px=(%.0f,%.0f)->(%.0f,%.0f) place_px=(%.0f,%.0f)->(%.0f,%.0f) mech=(%d,%d)->(%d,%d) rot=%.1f/%s"
             % (
                 record["name"],
+                float(pick_warp[0]),
+                float(pick_warp[1]),
+                float(pick_output_warp[0]),
+                float(pick_output_warp[1]),
+                float(place_warp[0]),
+                float(place_warp[1]),
+                float(place_output_warp[0]),
+                float(place_output_warp[1]),
                 record["pick_x"],
                 record["pick_y"],
                 record["place_x"],
@@ -3860,21 +5108,21 @@ def send_text(serial_obj, line):
     try:
         serial_obj.write(payload)
     except Exception as err:
-        print("UART WRITE FAIL %s" % err)
+        print("串口写入失败: %s" % err)
 
 
 def send_binary(serial_obj, packet, log_line=None):
     if log_line:
         print(log_line)
     else:
-        print("TX %d bytes" % len(packet))
+        print("发送 %d 字节" % len(packet))
     if serial_obj is None:
         return
 
     try:
         serial_obj.write(packet)
     except Exception as err:
-        print("UART WRITE FAIL %s" % err)
+        print("串口写入失败: %s" % err)
 
 
 def send_move_packet(result, serial_obj):
@@ -4027,7 +5275,7 @@ def simplify_piece_polygon(contour, perimeter):
                 break
         epsilon_ratio += PIECE_APPROX_EPSILON_STEP
 
-    if FIRST_QUESTION_MODE and PIECE_REFINE_CORNERS_BY_LINES and best is not None and 3 <= len(best) <= PIECE_MAX_POINTS:
+    if PIECE_REFINE_CORNERS_BY_LINES and best is not None and 3 <= len(best) <= PIECE_MAX_POINTS and cv2.isContourConvex(best):
         refined = refine_polygon_corners_by_lines(contour, best)
         if refined is not None:
             best = refined
@@ -4202,13 +5450,14 @@ def draw_warp_result(frame, result, fps):
 
 def draw_pieces(frame, pieces, piece_contours):
     for piece, contour in zip(pieces, piece_contours):
-        cv2.drawContours(frame, [contour], -1, BLUE, 2)
+        color = piece_display_color(piece)
+        cv2.drawContours(frame, [contour], -1, color, 2)
         cx, cy = piece["center"]
-        cv2.circle(frame, (cx, cy), 4, YELLOW, -1)
+        cv2.circle(frame, (cx, cy), 4, color, -1)
         label = str(piece["id"])
         if piece.get("template"):
             label += ":" + piece["template"]
-        cv2.putText(frame, label, (cx + 5, max(12, cy - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BLUE, 1)
+        cv2.putText(frame, label, (cx + 5, max(12, cy - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
 
 def piece_preview_transform(source_polygon, target_polygon):
@@ -4231,7 +5480,10 @@ def draw_target_texture_preview(frame, source_view, pieces):
     height, width = frame.shape[:2]
     for piece in pieces or []:
         source_polygon = piece.get("polygon")
-        target_polygon = piece.get("target_detected_polygon") or piece.get("final_detected_polygon")
+        target_polygon = (
+            piece.get("target_detected_polygon")
+            or piece.get("final_detected_polygon")
+        )
         if not source_polygon or not target_polygon:
             continue
         transform, transform_kind = piece_preview_transform(source_polygon, target_polygon)
@@ -4293,13 +5545,15 @@ def draw_second_question_targets(frame, pieces):
     for piece in pieces or []:
         if "target_center" not in piece:
             continue
-        if piece.get("target_detected_polygon"):
-            detected_polygon = np.asarray(piece["target_detected_polygon"], dtype=np.int32).reshape(-1, 1, 2)
-            cv2.drawContours(frame, [detected_polygon], -1, CYAN, 2)
+        color = piece_display_color(piece)
+        target_polygon = piece.get("target_detected_polygon")
+        if target_polygon:
+            detected_polygon = np.asarray(target_polygon, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.drawContours(frame, [detected_polygon], -1, color, 2)
         tx, ty = piece["target_center"]
-        cv2.circle(frame, (int(tx), int(ty)), 3, CYAN, -1)
+        cv2.circle(frame, (int(tx), int(ty)), 3, color, -1)
         label = piece.get("template", "P%d" % piece.get("id", 0))
-        cv2.putText(frame, label, (int(tx) + 4, max(12, int(ty) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
+        cv2.putText(frame, label, (int(tx) + 4, max(12, int(ty) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
 
 def draw_first_question_targets(frame, pieces):
@@ -4326,23 +5580,25 @@ def draw_first_question_targets(frame, pieces):
     for piece in pieces or []:
         if "target_center" not in piece:
             continue
-        if piece.get("target_detected_polygon"):
-            detected_polygon = np.asarray(piece["target_detected_polygon"], dtype=np.int32).reshape(-1, 1, 2)
-            cv2.drawContours(frame, [detected_polygon], -1, CYAN, 2)
+        color = piece_display_color(piece)
+        target_polygon = piece.get("target_detected_polygon")
+        if target_polygon:
+            detected_polygon = np.asarray(target_polygon, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.drawContours(frame, [detected_polygon], -1, color, 2)
         tx, ty = piece["target_center"]
-        cv2.circle(frame, (int(tx), int(ty)), 3, CYAN, -1)
+        cv2.circle(frame, (int(tx), int(ty)), 3, color, -1)
         if piece.get("template"):
-            cv2.putText(frame, piece["template"], (int(tx) + 4, max(12, int(ty) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1)
+            cv2.putText(frame, piece["template"], (int(tx) + 4, max(12, int(ty) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
 
 def draw_piece_debug_info(frame, result, fps, piece_debug):
     draw_text_bg(frame, 8, 24, "A4 OK  FPS:%d" % fps, GREEN, 0.7)
     if PIECE_MASK_METHOD == "hsv":
-        mask_info = "mode:%d HSV H:%d-%d thr:%d" % (
+        mask_info = "mode:%d GREEN H:%d-%d S>=%d" % (
             DISPLAY_MODE,
             PIECE_GREEN_H_LOW,
             PIECE_GREEN_H_HIGH,
-            int(PIECE_HSV_DIFF_THRESHOLD),
+            PIECE_GREEN_S_LOW,
         )
     elif PIECE_MASK_METHOD == "black":
         bg_color = piece_debug.get("bg_color")
@@ -4376,14 +5632,9 @@ def draw_piece_debug_info(frame, result, fps, piece_debug):
         0.5,
     )
     if PIECE_MASK_METHOD == "hsv":
-        detail = "S:%d-%d V:%d-%d blur:%dx%d med:%d" % (
-            PIECE_GREEN_S_LOW,
-            PIECE_GREEN_S_HIGH,
-            PIECE_GREEN_V_LOW,
-            PIECE_GREEN_V_HIGH,
-            PIECE_HSV_DIFF_BLUR_KERNEL[0],
-            PIECE_HSV_DIFF_BLUR_KERNEL[1],
-            PIECE_MASK_MEDIAN_KERNEL,
+        detail = "green_bg:HS med:%s/%d" % (
+            "on" if PIECE_HSV_MEDIAN_ENABLED else "off",
+            PIECE_MASK_MEDIAN_KERNEL if PIECE_HSV_MEDIAN_ENABLED else 0,
         )
     elif PIECE_MASK_METHOD == "black":
         detail = "min:%d off:%d blur:%dx%d med:%d" % (
@@ -4480,6 +5731,9 @@ def make_display_view(frame, result, fps, a4_warp=None, pieces=None, piece_conto
         source_view = texture_source if texture_source is not None else view
         draw_target_texture_preview(view, source_view, pieces or [])
         draw_question_targets(view, pieces or [])
+        if PIECE_DEBUG_OVERLAY_RAW_CONTOUR:
+            # 红线 3 像素打底，蓝色最终多边形随后覆盖；重合时仍能看到红色边缘。
+            cv2.drawContours(view, piece_debug.get("accepted_source_contours", []), -1, RED, 3)
         draw_pieces(view, pieces or [], piece_contours or [])
         draw_warp_result(view, result, fps)
         return view
@@ -4531,7 +5785,7 @@ def create_serial():
     try:
         return uart.UART(SERIAL_PORT, SERIAL_BAUDRATE)
     except Exception as err:
-        print("UART OPEN FAIL %s" % err)
+        print("串口打开失败: %s" % err)
         return None
 
 
@@ -4570,12 +5824,13 @@ def main():
     capture_samples = []
     held_result = None
     held_piece_contours = []
+    held_piece_debug = make_empty_piece_debug()
     held_matrix = None
     held_a4_warp = None
     held_until_ms = 0
     capture_wait_logged = False
     if AUTO_CAPTURE_ON_START:
-        print("AUTO CAPTURE ENABLED")
+        print("自动捕获已启用")
 
     while not app.need_exit():
         loop_start_ms = time.ticks_ms()
@@ -4602,10 +5857,18 @@ def main():
             now_for_capture = time.ticks_ms()
             if capture_requested:
                 capture_requested = False
+                if held_result is not None:
+                    held_result = None
+                    held_piece_contours = []
+                    held_piece_debug = make_empty_piece_debug()
+                    held_matrix = None
+                    held_a4_warp = None
+                    held_until_ms = 0
+                    release_task_memory()
                 capture_remaining = CAPTURE_FRAME_COUNT
                 capture_samples = []
                 capture_wait_logged = False
-                print("CAPTURE START frames=%d" % CAPTURE_FRAME_COUNT)
+                print("捕获开始: 帧数=%d" % CAPTURE_FRAME_COUNT)
 
             if capture_remaining > 0:
                 pieces, piece_contours, piece_debug = detect_pieces(frame, result["corners"], matrix)
@@ -4622,21 +5885,48 @@ def main():
                     if aggregated_result is not None:
                         held_result = aggregated_result
                         held_piece_contours = aggregated_contours
+                        # 结果保持期间继续使用最后一个有效采集帧的红色原始轮廓。
+                        held_piece_debug = piece_debug
                         held_matrix, _ = a4_perspective_matrices(held_result["corners"])
                         held_a4_warp = cv2.warpPerspective(frame, held_matrix, (WARP_W, WARP_H))
                         held_until_ms = now_for_capture + CAPTURE_HOLD_MS
                         output_result = held_result
                         pieces = held_result.get("pieces", [])
                         piece_contours = held_piece_contours
-                        print("CAPTURE OK valid=%d pieces=%d" % (held_result.get("capture_frames", 0), len(pieces)))
+                        print("捕获成功: 有效帧=%d 碎片数=%d A4=%s" % (
+                            held_result.get("capture_frames", 0),
+                            len(pieces),
+                            held_result.get("a4_method", "unknown"),
+                        ))
+                        print("A4 STABLE CORNERS TL/TR/BR/BL=%s" % held_result.get("corners"))
+                        if MECH_DIRECT_OUTPUT_CALIBRATION_ENABLED:
+                            print("MECH OUTPUT CAL TL/TR/BR/BL=%s" % (
+                                MECH_OUTPUT_CALIBRATION_POINTS,))
+                        else:
+                            print("MECH CAL POINTS TL/TR/BR/BL=%s swap_xy=%s" % (
+                                MECH_CALIBRATION_POINTS, MECH_SWAP_XY_FOR_STM32))
                         send_move_packet(held_result, serial_obj)
+                        released_samples, released_cache = release_task_memory(capture_samples)
+                        print("TASK MEMORY RELEASE samples=%d rotation_cache=%d" % (
+                            released_samples, released_cache))
                     else:
                         held_result = None
                         held_piece_contours = []
+                        held_piece_debug = make_empty_piece_debug()
                         held_matrix = None
                         held_a4_warp = None
                         held_until_ms = 0
-                        print("CAPTURE FAIL valid=%d" % len(capture_samples))
+                        print("捕获失败: 有效帧=%d" % len(capture_samples))
+                        corner_samples = [
+                            sample for sample in capture_samples
+                            if sample.get("status") and sample.get("corners") is not None
+                        ]
+                        if corner_samples:
+                            print("A4 CAPTURE CORNERS TL/TR/BR/BL=%s" % (
+                                average_a4_corners(corner_samples),))
+                        released_samples, released_cache = release_task_memory(capture_samples)
+                        print("TASK MEMORY RELEASE samples=%d rotation_cache=%d" % (
+                            released_samples, released_cache))
             elif held_result is not None and now_for_capture <= held_until_ms:
                 output_result = held_result
                 pieces = held_result.get("pieces", [])
@@ -4644,14 +5934,16 @@ def main():
             elif held_result is not None and now_for_capture > held_until_ms:
                 held_result = None
                 held_piece_contours = []
+                held_piece_debug = make_empty_piece_debug()
                 held_matrix = None
                 held_a4_warp = None
                 held_until_ms = 0
+                release_task_memory()
             pieces_end_ms = time.ticks_ms()
         else:
             now_for_capture = time.ticks_ms()
             if capture_requested and not capture_wait_logged:
-                print("CAPTURE WAIT A4")
+                print("等待检测A4纸")
                 capture_wait_logged = True
             if held_result is not None and now_for_capture <= held_until_ms:
                 output_result = held_result
@@ -4660,9 +5952,11 @@ def main():
             elif held_result is not None and now_for_capture > held_until_ms:
                 held_result = None
                 held_piece_contours = []
+                held_piece_debug = make_empty_piece_debug()
                 held_matrix = None
                 held_a4_warp = None
                 held_until_ms = 0
+                release_task_memory()
             matrix_start_ms = matrix_end_ms = time.ticks_ms()
             pieces_start_ms = pieces_end_ms = matrix_end_ms
 
@@ -4674,6 +5968,7 @@ def main():
         if output_result is held_result and held_matrix is not None:
             display_result = held_result
             display_matrix = held_matrix
+            piece_debug = held_piece_debug
             texture_source = held_a4_warp
         elif output_result is not result and result.get("status"):
             display_result = result.copy()
@@ -4699,7 +5994,7 @@ def main():
             fps = frame_count
             if PERF_PROFILE and frame_count > 0:
                 print(
-                    "PERF n=%d image2cv=%.1f a4=%.1f matrix=%.1f pieces=%.1f display=%.1f total=%.1f ms"
+                    "性能: n=%d 图像转换=%.1f A4检测=%.1f 矩阵=%.1f 碎片=%.1f 显示=%.1f 总计=%.1f 毫秒"
                     % (
                         frame_count,
                         perf_accum["image2cv"] / frame_count,
@@ -4724,6 +6019,11 @@ def main():
 
     if key_obj:
         del key_obj
+    detector.debug.clear()
+    release_task_memory(capture_samples)
+    close_runtime_resource(serial_obj)
+    close_runtime_resource(cam)
+    close_runtime_resource(disp)
 
 
 if __name__ == "__main__":
